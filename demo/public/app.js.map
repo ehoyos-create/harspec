@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "file": "app.js",
+  "sources": ["../src/main.js"],
+  "sourcesContent": [
+    "// ORIGINAL SOURCE - shipped to production by mistake.\n// TODO(nico): remove this map before the release, it exposes the admin route.\nconst ADMIN_ROUTE = \"/internal/admin-settings\";\nconst API_BASE = \"http://localhost:3000\";\n\nexport async function login(email, password) {\n  const response = await fetch(`${API_BASE}/api/auth/login`, {\n    method: \"POST\",\n    headers: { \"content-type\": \"application/json\" },\n    body: JSON.stringify({ email, password }),\n  });\n  return response.json();\n}\n\nexport function isValidEmail(value) {\n  return /\\S+@\\S+\\.\\S+/.test(value);\n}\n"
+  ],
+  "names": [],
+  "mappings": ""
+}

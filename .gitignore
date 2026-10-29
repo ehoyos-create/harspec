@@ -1,0 +1,6 @@
+node_modules/
+dist/
+harspec-out/
+*.log
+.DS_Store
+demo/session.har

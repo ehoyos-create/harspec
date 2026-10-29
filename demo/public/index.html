@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Demo Shop — harspec target</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; }
+      h1 { font-size: 1.4rem; }
+      code { background: #f2f2f2; padding: .15rem .35rem; border-radius: 4px; }
+      .note { color: #666; font-size: .9rem; border-left: 3px solid #ddd; padding-left: .8rem; }
+      li { margin: .4rem 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Demo Shop</h1>
+    <p class="note">
+      Intentionally vulnerable target for <code>harspec</code>. Localhost only.
+    </p>
+    <ul>
+      <li><code>GET /api/products?page=1&amp;limit=2</code></li>
+      <li><code>POST /api/auth/login</code></li>
+      <li><code>POST /api/cart/items</code> — trusts the price you send</li>
+      <li><code>POST /api/checkout</code> — trusts the total you send</li>
+      <li><code>GET /api/users/1</code> — no ownership check</li>
+      <li><code>GET /api/debug/env</code> — leaks configuration</li>
+    </ul>
+    <script src="/app.js"></script>
+  </body>
+</html>

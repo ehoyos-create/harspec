@@ -1,0 +1,37 @@
+{
+  "name": "harspec",
+  "version": "0.1.0",
+  "description": "Turn any web app's traffic into an OpenAPI spec, a typed TypeScript client, and a risk report. Zero dependencies.",
+  "type": "module",
+  "bin": {
+    "harspec": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "DISCLAIMER.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "node src/cli.ts",
+    "demo:serve": "node demo/server.mjs",
+    "demo:record": "node demo/record.mjs",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "keywords": [
+    "har",
+    "openapi",
+    "reverse-engineering",
+    "api",
+    "security",
+    "spa"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
