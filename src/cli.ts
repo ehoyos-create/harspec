@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * harspec — turn recorded web traffic into an API spec, a typed client and a
- * risk report.
+ * harspec — turn web apps into an API spec, a typed client and a risk report.
  *
- * Deterministic pipeline:
- *   HAR → normalize → cluster into operations → infer schemas → emit artifacts
+ * Two modes:
+ *   harspec <capture.har>        full pipeline from recorded traffic
+ *   harspec web <url>            public surface, no session, no browser
  *
- * The core calls no model: same capture in, same files out.
+ * The core is deterministic: same input in, same files out. No model calls.
  */
 
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -18,12 +18,14 @@ import { passiveFindings, renderReportMarkdown, severityRank, type Finding } fro
 import { activeFindings } from './replay.ts';
 import { scanBundles } from './scan.ts';
 import { plural, uniq } from './util.ts';
+import { analyseWeb, buildSkeletonOpenApi } from './web.ts';
 import { toYaml } from './yaml.ts';
 
 const VERSION = '0.1.0';
 
 interface Args {
-  har?: string;
+  mode: 'har' | 'web';
+  input?: string;
   out: string;
   title?: string;
   replay: boolean;
@@ -37,6 +39,7 @@ interface Args {
 
 function parseArgs(argv: string[]): Args {
   const args: Args = {
+    mode: 'har',
     out: 'harspec-out',
     replay: false,
     allowHosts: [],
@@ -47,51 +50,66 @@ function parseArgs(argv: string[]): Args {
     version: false,
   };
 
-  const rest: string[] = [];
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
+  let rest = argv;
+  if (rest[0] === 'web') {
+    args.mode = 'web';
+    rest = rest.slice(1);
+  }
+
+  const positionals: string[] = [];
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i];
     if (arg === '-h' || arg === '--help') args.help = true;
     else if (arg === '-v' || arg === '--version') args.version = true;
-    else if (arg === '-o' || arg === '--out') args.out = argv[++i] ?? args.out;
-    else if (arg === '--title') args.title = argv[++i];
+    else if (arg === '-o' || arg === '--out') args.out = rest[++i] ?? args.out;
+    else if (arg === '--title') args.title = rest[++i];
     else if (arg === '--replay') args.replay = true;
-    else if (arg === '--allow-host') args.allowHosts.push(argv[++i] ?? '');
+    else if (arg === '--allow-host') args.allowHosts.push(rest[++i] ?? '');
     else if (arg === '--scan-bundles') args.scanBundles = true;
     else if (arg === '--quiet' || arg === '-q') args.quiet = true;
     else if (arg === '--json') args.json = true;
     else if (arg.startsWith('-')) throw new Error(`Unknown option: ${arg}`);
-    else rest.push(arg);
+    else positionals.push(arg);
   }
 
-  args.har = rest[0];
+  args.input = positionals[0];
   return args;
 }
 
 function help(): string {
   return [
     '',
-    '  harspec — turn recorded web traffic into an API spec, a typed client and a risk report',
+    '  harspec — web app → API spec, typed client, risk report',
     '',
     '  Usage',
-    '    harspec <capture.har> [options]',
+    '    harspec <capture.har> [options]      full pipeline from recorded traffic',
+    '    harspec web <url> [options]          public surface, no session, no browser',
     '',
     '  Options',
     '    -o, --out <dir>        Output directory (default: ./harspec-out)',
     '        --title <text>     API title used in the spec',
-    '        --scan-bundles     Fetch the JS in the capture and scan it for secrets and source maps',
-    '        --replay           Replay captured writes with tampered fields (localhost by default)',
-    '        --allow-host <h>   Extend the replay allowlist to another host (repeatable)',
+    '        --scan-bundles     (har) Fetch the JS in the capture and scan it',
+    '        --replay           (har) Replay captured writes with tampered fields (localhost by default)',
+    '        --allow-host <h>   (har) Extend the replay allowlist (repeatable)',
     '    -q, --quiet            Only print the output directory',
     '        --json             Print the summary as JSON',
     '    -v, --version          Print version',
     '    -h, --help             Print this help',
     '',
-    '  How to capture',
+    '  Two modes, one honest difference',
+    '    web     Reads the HTML and JavaScript any anonymous visitor receives.',
+    '            Finds endpoints, routes and leaked secrets. No schemas, because',
+    '            it never calls the API.',
+    '    har     Reads a capture of a real session, including authenticated calls.',
+    '            Infers schemas and emits a typed client that actually runs.',
+    '',
+    '  How to capture a HAR',
     '    Chrome / Edge: DevTools → Network → right click → "Save all as HAR with content"',
     '    Firefox:       Network → gear icon → "Save All As HAR"',
     '    Safari:        Network → Export',
     '',
-    '  Example',
+    '  Examples',
+    '    harspec web https://app.example.com',
     '    harspec session.har --scan-bundles --replay',
     '',
   ].join('\n');
@@ -120,30 +138,47 @@ function sortFindings(findings: Finding[]): Finding[] {
   return [...findings].sort((a, b) => severityRank(a.severity) - severityRank(b.severity));
 }
 
-async function main(): Promise<number> {
-  let args: Args;
-  try {
-    args = parseArgs(process.argv.slice(2));
-  } catch (error: any) {
-    console.error(red(`error: ${error.message}`));
-    console.error(help());
-    return 1;
+function printFindings(findings: Finding[]) {
+  for (const finding of findings.slice(0, 10)) {
+    const tag = severityColor[finding.severity](finding.severity.toUpperCase().padEnd(8));
+    console.log(`  ${tag} ${finding.title}`);
   }
+  if (findings.length > 10) console.log(dim(`  … ${findings.length - 10} more in report.md`));
+}
 
-  if (args.version) {
-    console.log(VERSION);
-    return 0;
-  }
-  if (args.help) {
-    console.log(help());
-    return 0;
-  }
-  if (!args.har) {
-    console.log(help());
-    return 1;
-  }
+function findingsLine(findings: Finding[]): string {
+  if (!findings.length) return 'no findings';
+  const counts = findings.reduce<Record<string, number>>((acc, f) => {
+    acc[f.severity] = (acc[f.severity] ?? 0) + 1;
+    return acc;
+  }, {});
+  const detail = ['critical', 'high', 'medium', 'low', 'info']
+    .filter((s) => counts[s])
+    .map((s) => `${counts[s]} ${s}`)
+    .join(', ');
+  return `${plural(findings.length, 'finding', 'findings')} (${detail})`;
+}
 
-  const harPath = resolve(args.har);
+function writeReport(outDir: string, input: {
+  target: string;
+  capturedAt: string;
+  entries: Entry[];
+  operations: number;
+  findings: Finding[];
+}) {
+  writeFileSync(join(outDir, 'report.md'), renderReportMarkdown(input));
+  writeFileSync(
+    join(outDir, 'findings.json'),
+    `${JSON.stringify({ target: input.target, findings: sortFindings(input.findings) }, null, 2)}\n`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HAR mode: full pipeline
+// ---------------------------------------------------------------------------
+
+async function runHar(args: Args): Promise<number> {
+  const harPath = resolve(args.input as string);
   let entries: Entry[];
   try {
     entries = readHar(harPath);
@@ -168,8 +203,8 @@ async function main(): Promise<number> {
   const target = hosts.length === 1 ? hosts[0] : `${hosts[0]} (+${hosts.length - 1} more)`;
   const origin = entries.find((e) => e.origin)?.origin ?? `https://${hosts[0]}`;
   const capturedAt = entries.find((e) => e.startedAt)?.startedAt ?? '';
-
   const quiet = args.quiet || args.json;
+
   if (!quiet) {
     console.log('');
     console.log(`${bold('harspec')} ${dim(`v${VERSION}`)}`);
@@ -187,23 +222,17 @@ async function main(): Promise<number> {
   const findings: Finding[] = [...passiveFindings(entries)];
 
   if (args.scanBundles) {
-    const scanned = await scanBundles(entries, {
-      onProgress: quiet ? undefined : (m) => console.log(dim(`  ${m}`)),
-    });
-    findings.push(...scanned);
+    findings.push(
+      ...(await scanBundles(entries, { onProgress: quiet ? undefined : (m) => console.log(dim(`  ${m}`)) })),
+    );
   }
 
   if (args.replay) {
     const localHosts = entries.map((e) => e.host).filter((h) => h === 'localhost' || h === '127.0.0.1');
     const allowHosts = uniq(['localhost', '127.0.0.1', ...localHosts, ...args.allowHosts.filter(Boolean)]);
-
     if (!quiet) {
-      const extra = args.allowHosts.filter(Boolean);
-      console.log(
-        dim(`  replay allowlist: localhost${extra.length ? `, ${extra.join(', ')}` : ' (use --allow-host for others)'}`),
-      );
+      console.log(dim('  replay allowlist: localhost (use --allow-host for others)'));
     }
-
     findings.push(
       ...(await activeFindings(clusters, {
         allowHosts,
@@ -219,29 +248,17 @@ async function main(): Promise<number> {
   writeFileSync(join(outDir, 'openapi.json'), `${JSON.stringify(document, null, 2)}\n`);
   writeFileSync(join(outDir, 'openapi.yaml'), toYaml(document));
   writeFileSync(join(outDir, 'client.ts'), client);
-  writeFileSync(
-    join(outDir, 'findings.json'),
-    `${JSON.stringify({ target, capturedAt, findings: sorted }, null, 2)}\n`,
-  );
-  writeFileSync(
-    join(outDir, 'report.md'),
-    renderReportMarkdown({
-      target,
-      capturedAt,
-      entries,
-      operations: summary.operations,
-      findings: sorted,
-    }),
-  );
+  writeReport(outDir, { target, capturedAt, entries, operations: summary.operations, findings: sorted });
 
   if (args.json) {
     console.log(
       JSON.stringify(
         {
+          mode: 'har',
           target,
           out: outDir,
-          operations: summary.operations,
           paths: summary.paths,
+          operations: summary.operations,
           findings: sorted.map((f) => ({ severity: f.severity, title: f.title, id: f.id })),
         },
         null,
@@ -261,32 +278,132 @@ async function main(): Promise<number> {
   );
   console.log(`${green('✓')} ${bold('openapi.yaml')}`);
   console.log(`${green('✓')} ${bold('client.ts')}     ${dim(plural(clusters.length, 'method', 'methods'))}`);
-
-  const counts = sorted.reduce<Record<string, number>>((acc, f) => {
-    acc[f.severity] = (acc[f.severity] ?? 0) + 1;
-    return acc;
-  }, {});
-  const summaryLine = ['critical', 'high', 'medium', 'low', 'info']
-    .filter((s) => counts[s])
-    .map((s) => `${counts[s]} ${s}`)
-    .join(', ');
-
-  console.log(
-    `${green('✓')} ${bold('report.md')}     ${dim(sorted.length ? `${plural(sorted.length, 'finding', 'findings')} (${summaryLine})` : 'no findings')}`,
-  );
+  console.log(`${green('✓')} ${bold('report.md')}     ${dim(findingsLine(sorted))}`);
   console.log('');
-
-  for (const finding of sorted.slice(0, 10)) {
-    const tag = severityColor[finding.severity](finding.severity.toUpperCase().padEnd(8));
-    console.log(`  ${tag} ${finding.title}`);
+  if (sorted.length) {
+    printFindings(sorted);
+    console.log('');
   }
-  if (sorted.length > 10) console.log(dim(`  … ${sorted.length - 10} more in report.md`));
-  if (sorted.length) console.log('');
-
   console.log(dim(`  output: ${outDir}`));
   console.log('');
 
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Web mode: public surface, no session
+// ---------------------------------------------------------------------------
+
+async function runWeb(args: Args): Promise<number> {
+  const quiet = args.quiet || args.json;
+  const target = args.input as string;
+
+  let analysis;
+  try {
+    analysis = await analyseWeb(target, {
+      onProgress: quiet ? undefined : (m) => console.log(dim(`  ${m}`)),
+    });
+  } catch (error: any) {
+    console.error(red(`error: ${error.message}`));
+    return 1;
+  }
+
+  const sorted = sortFindings(analysis.findings);
+  const document = buildSkeletonOpenApi(analysis);
+  const outDir = resolve(args.out);
+  mkdirSync(outDir, { recursive: true });
+
+  writeFileSync(join(outDir, 'surface.md'), analysis.surfaceMarkdown);
+  writeFileSync(join(outDir, 'openapi.json'), `${JSON.stringify(document, null, 2)}\n`);
+  writeFileSync(join(outDir, 'openapi.yaml'), toYaml(document));
+  writeReport(outDir, {
+    target: analysis.finalUrl,
+    capturedAt: analysis.entries[0]?.startedAt ?? '',
+    entries: analysis.entries,
+    operations: analysis.apiEndpoints.length,
+    findings: sorted,
+  });
+
+  if (args.json) {
+    console.log(
+      JSON.stringify(
+        {
+          mode: 'web',
+          target: analysis.finalUrl,
+          out: outDir,
+          frameworks: analysis.frameworks,
+          apiPaths: analysis.apiEndpoints.length,
+          routes: analysis.routes.length,
+          findings: sorted.map((f) => ({ severity: f.severity, title: f.title, id: f.id })),
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  if (args.quiet) {
+    console.log(outDir);
+    return 0;
+  }
+
+  console.log('');
+  console.log(`${bold('harspec')} ${dim(`v${VERSION} · static mode (no session)`)}`);
+  console.log(`${dim('url      ')} ${analysis.finalUrl}`);
+  console.log(`${dim('stack    ')} ${analysis.frameworks.join(', ') || 'not identified'}`);
+  console.log(
+    `${dim('read     ')} ${plural(analysis.entries.length, 'resource', 'resources')} · ${plural(analysis.apiEndpoints.length, 'API path', 'API paths')} · ${plural(analysis.routes.length, 'UI route', 'UI routes')}`,
+  );
+  console.log('');
+  console.log(`${green('✓')} ${bold('surface.md')}    ${dim('what the public bundle reveals')}`);
+  console.log(`${green('✓')} ${bold('openapi.json')}  ${dim(`${plural(analysis.apiEndpoints.length, 'path', 'paths')} (skeleton, no schemas)`)}`);
+  console.log(`${green('✓')} ${bold('openapi.yaml')}`);
+  console.log(`${green('✓')} ${bold('report.md')}     ${dim(findingsLine(sorted))}`);
+  console.log('');
+
+  if (sorted.length) {
+    printFindings(sorted);
+    console.log('');
+  }
+
+  console.log(
+    dim(
+      '  static mode cannot see schemas or authenticated routes. capture a HAR for the full pipeline.',
+    ),
+  );
+  console.log(dim(`  output: ${outDir}`));
+  console.log('');
+
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<number> {
+  let args: Args;
+  try {
+    args = parseArgs(process.argv.slice(2));
+  } catch (error: any) {
+    console.error(red(`error: ${error.message}`));
+    console.error(help());
+    return 1;
+  }
+
+  if (args.version) {
+    console.log(VERSION);
+    return 0;
+  }
+  if (args.help) {
+    console.log(help());
+    return 0;
+  }
+  if (!args.input) {
+    console.log(help());
+    return 1;
+  }
+
+  return args.mode === 'web' ? runWeb(args) : runHar(args);
 }
 
 main()

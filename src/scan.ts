@@ -1,9 +1,11 @@
 /**
  * Bundle scanning.
  *
- * Reads the JavaScript the browser already downloaded and looks for the things
- * that end up in real findings: leaked keys, exposed source maps, internal
- * hosts. Passive GETs to URLs already present in the capture, nothing else.
+ * Reads the JavaScript a browser would already download and looks for the things
+ * that end up in real findings: leaked keys, exposed source maps, internal hosts.
+ *
+ * `inspectSource` is pure: give it text and it returns findings. `scanBundles`
+ * is the HAR-driven wrapper that fetches first.
  */
 
 import type { Entry } from './har.ts';
@@ -20,12 +22,79 @@ const SECRETS: Array<{ id: string; label: string; rx: RegExp; severity: Finding[
   {
     id: 'generic',
     label: 'Hardcoded credential',
-    rx: /(?:api[_-]?key|secret|passwd|password|token)\s*[:=]\s*["']([A-Za-z0-9_\-\.]{16,})["']/gi,
+    rx: /(?:api[_-]?key|secret|passwd|password|token)\s*[:=]\s*["']([A-Za-z0-9_\-.@]{16,})["']/gi,
     severity: 'high',
   },
 ];
 
 const FALSE_POSITIVE = /(example|your[_-]?|xxxx|placeholder|changeme|test[_-]?key|process\.env|import\.meta\.env)/i;
+
+const INTERNAL_HOST_RX =
+  /https?:\/\/([a-z0-9.-]+\.(?:internal|local|svc|cluster\.local)|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)(?::\d+)?/gi;
+
+/** Findings derivable from one JavaScript file, with no network access. */
+export function inspectSource(source: string, url: string, entries: Entry[] = []): Finding[] {
+  const findings: Finding[] = [];
+  const fileName = url.split('/').pop() ?? url;
+  const related = entries.filter((e) => e.url === url).map((e) => e.index);
+
+  // Source maps
+  const mapRef = source.match(/[#@]\s*sourceMappingURL=(\S+)/);
+  if (mapRef) {
+    findings.push({
+      id: `sourcemap/${url}`,
+      severity: 'high',
+      title: 'Source maps are referenced and potentially public',
+      evidence: `${fileName} declares ${mapRef[1]}`,
+      impact:
+        'The original, unminified source — comments included — can be reconstructed. Any logic hidden by minification is exposed.',
+      remediation: 'Do not publish .map files in production, or restrict them to authenticated internal users.',
+      entries: related,
+    });
+  }
+
+  // Secrets
+  let specificFound = false;
+  for (const rule of SECRETS) {
+    if (rule.id === 'generic' && specificFound) continue;
+    rule.rx.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = rule.rx.exec(source))) {
+      const raw = match[0];
+      if (FALSE_POSITIVE.test(raw)) continue;
+      findings.push({
+        id: `secret/${rule.id}/${url}`,
+        severity: rule.severity,
+        title: `${rule.label} found in a client bundle`,
+        evidence: `${fileName}: ${raw.slice(0, 24)}…`,
+        impact: 'Anything shipped to the browser is public. This key is compromised the moment it is deployed.',
+        remediation: 'Rotate the key immediately and move the call behind a server-side proxy.',
+        entries: related,
+      });
+      if (rule.id !== 'generic') specificFound = true;
+      break;
+    }
+  }
+
+  // Internal hosts
+  const hosts = new Set<string>();
+  let hostMatch: RegExpExecArray | null;
+  INTERNAL_HOST_RX.lastIndex = 0;
+  while ((hostMatch = INTERNAL_HOST_RX.exec(source))) hosts.add(hostMatch[0]);
+  if (hosts.size) {
+    findings.push({
+      id: `internal-host/${url}`,
+      severity: 'medium',
+      title: 'Internal hostnames leaked in the bundle',
+      evidence: [...hosts].slice(0, 5).join(', '),
+      impact: 'Maps the private network for anyone reading the JavaScript.',
+      remediation: 'Build these values in at deploy time from server-side config.',
+      entries: related,
+    });
+  }
+
+  return findings;
+}
 
 export interface ScanOptions {
   maxScripts?: number;
@@ -43,9 +112,12 @@ export function scriptUrls(entries: Entry[]): string[] {
   return [...urls];
 }
 
-async function getText(url: string, timeoutMs: number, maxBytes: number): Promise<string | undefined> {
+export async function getText(url: string, timeoutMs = 12_000, maxBytes = 4_000_000): Promise<string | undefined> {
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { 'user-agent': 'harspec/0.1 (+https://github.com/harspec)' },
+    });
     if (!response.ok) return undefined;
     const reader = response.body?.getReader();
     if (!reader) return await response.text();
@@ -70,74 +142,27 @@ async function getText(url: string, timeoutMs: number, maxBytes: number): Promis
 export async function scanBundles(entries: Entry[], options: ScanOptions = {}): Promise<Finding[]> {
   const findings: Finding[] = [];
   const maxScripts = options.maxScripts ?? 15;
-  const maxBytes = options.maxBytes ?? 4_000_000;
-  const timeoutMs = options.timeoutMs ?? 12_000;
-
   const urls = scriptUrls(entries).slice(0, maxScripts);
 
   for (const url of urls) {
     options.onProgress?.(`scanning ${url.split('/').pop()}`);
-    const source = await getText(url, timeoutMs, maxBytes);
+    const source = await getText(url, options.timeoutMs ?? 12_000, options.maxBytes ?? 4_000_000);
     if (!source) continue;
-
-    // Source maps
-    const mapRef = source.match(/[#@]\s*sourceMappingURL=(\S+)/);
-    if (mapRef) {
-      const mapUrl = new URL(mapRef[1], url).toString();
-      const map = await getText(mapUrl, timeoutMs, maxBytes);
-      if (map) {
-        findings.push({
-          id: `sourcemap/${url}`,
-          severity: 'high',
-          title: 'Source maps are publicly available',
-          evidence: `${url.split('/').pop()} references ${mapRef[1]}, which resolves and returns content (${Math.round(map.length / 1024)} KB)`,
-          impact: 'The original, unminified source — comments included — can be reconstructed. Any logic hidden by minification is exposed.',
-          remediation: 'Do not publish .map files in production, or restrict them to authenticated internal users.',
-          entries: entries.filter((e) => e.url === url).map((e) => e.index),
-        });
-      }
-    }
-
-    // Secrets
-    let specificFound = false;
-    for (const rule of SECRETS) {
-      if (rule.id === 'generic' && specificFound) continue;
-      rule.rx.lastIndex = 0;
-      let match: RegExpExecArray | null;
-      while ((match = rule.rx.exec(source))) {
-        const raw = match[0];
-        if (FALSE_POSITIVE.test(raw)) continue;
-        findings.push({
-          id: `secret/${rule.id}/${url}`,
-          severity: rule.severity,
-          title: `${rule.label} found in a client bundle`,
-          evidence: `${url.split('/').pop()}: ${raw.slice(0, 24)}…`,
-          impact: 'Anything shipped to the browser is public. This key is compromised the moment it is deployed.',
-          remediation: 'Rotate the key immediately and move the call behind a server-side proxy.',
-          entries: entries.filter((e) => e.url === url).map((e) => e.index),
-        });
-        if (rule.id !== 'generic') specificFound = true;
-        break;
-      }
-    }
-
-    // Internal hosts
-    const hosts = new Set<string>();
-    const hostRx = /https?:\/\/([a-z0-9.-]+\.(?:internal|local|svc|cluster\.local)|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+)(?::\d+)?/gi;
-    let hostMatch: RegExpExecArray | null;
-    while ((hostMatch = hostRx.exec(source))) hosts.add(hostMatch[0]);
-    if (hosts.size) {
-      findings.push({
-        id: `internal-host/${url}`,
-        severity: 'medium',
-        title: 'Internal hostnames leaked in the bundle',
-        evidence: [...hosts].slice(0, 5).join(', '),
-        impact: 'Maps the private network for anyone reading the JavaScript.',
-        remediation: 'Build these values in at deploy time from server-side config.',
-        entries: entries.filter((e) => e.url === url).map((e) => e.index),
-      });
-    }
+    findings.push(...inspectSource(source, url, entries));
   }
 
   return findings;
+}
+
+/** Confirm whether a referenced source map actually resolves. */
+export async function sourceMapResolves(mapUrl: string, timeoutMs = 8000): Promise<boolean> {
+  try {
+    const response = await fetch(mapUrl, {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { 'user-agent': 'harspec/0.1' },
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }

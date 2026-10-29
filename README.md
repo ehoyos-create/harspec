@@ -8,6 +8,19 @@ You browse an app. You export the HAR. `harspec` reconstructs the API behind it 
 harspec session.har
 ```
 
+No capture yet? Point it at a URL instead:
+
+```bash
+harspec web https://app.example.com
+```
+
+```
+harspec v0.1.0 · static mode (no session)
+url       https://vercel.com
+stack     Next.js
+read      11 resources · 10 API paths · 76 UI routes
+```
+
 ```
 harspec v0.1.0
 target   app.example.com
@@ -41,14 +54,30 @@ Three design rules make the output trustworthy:
 2. **Every finding cites evidence.** Not "this looks vulnerable" but `POST /api/cart/items accepted price set to 0 (HTTP 201)` plus the HAR entry index that proves it.
 3. **It says what it does not know.** Inference is conservative by design. A field is only marked required if it appeared in every observed sample.
 
+## Two modes, one honest difference
+
+| | `harspec web <url>` | `harspec <capture.har>` |
+|---|---|---|
+| Needs a session | No | Only what your browser already had |
+| Network activity | One page + its own assets | None (passive by default) |
+| API paths | Discovered in the bundle | Discovered **and exercised** |
+| Parameters and schemas | — | Inferred from real traffic |
+| Typed client | — | Yes, and it is tested against the live API |
+| Works behind anti-bot | Yes, it is a plain GET | Yes |
+
+Static mode reads what any anonymous visitor receives: HTML, the JavaScript it ships, the routes it links to. It is the right first look — cheap, instant, no legal ambiguity. It cannot see schemas, because it never calls the API.
+
+HAR mode is the full pipeline. You browse once, export, and get the contract plus a client that runs.
+
 ## What you get
 
-| Artifact | What it is |
-|---|---|
-| `openapi.json` / `openapi.yaml` | OpenAPI 3.1 document built from observed requests: paths, parameters, request/response schemas, inferred auth |
-| `client.ts` | Dependency-free TypeScript client. One typed method per operation, uses the global `fetch` |
-| `report.md` | Security findings with evidence, impact and remediation |
-| `findings.json` | The same findings, machine-readable |
+| Artifact | Mode | What it is |
+|---|---|---|
+| `openapi.json` / `openapi.yaml` | both | HAR: OpenAPI 3.1 built from observed calls. web: a skeleton of discovered paths, marked `x-harspec-mode: static` |
+| `client.ts` | HAR | Dependency-free TypeScript client, one typed method per operation |
+| `surface.md` | web | Stack, API paths, UI routes, third-party hosts, auth signals |
+| `report.md` | both | Security findings with evidence, impact and remediation |
+| `findings.json` | both | The same findings, machine-readable |
 
 ## Try it in 60 seconds
 
@@ -70,6 +99,19 @@ node src/cli.ts demo/session.har --scan-bundles --replay
 ```
 
 Node 22.18+ and 24 run the TypeScript sources directly. On older versions, `npm run build` and use `node dist/cli.js`.
+
+## Verified on
+
+Real sites, static mode, no session, 2026-10-29:
+
+| Target | Detected stack | API paths | UI routes |
+|---|---|---|---|
+| `vercel.com` | Next.js | 10 | 76 |
+| `linear.app` | Next.js | 9 | 40 |
+| `notion.so` | Next.js | 6 | 58 |
+| included demo | vanilla | 7 | 0 |
+
+Static mode reads public bundles only. HAR mode is what proves the contract.
 
 ## Install
 
@@ -98,12 +140,13 @@ Browse the flows you care about *before* exporting. Ten minutes of clicking prod
 
 ```
 harspec <capture.har> [options]
+harspec web <url>     [options]
 
   -o, --out <dir>       output directory (default ./harspec-out)
       --title <text>    API title in the spec
-      --scan-bundles    fetch the JS in the capture; look for leaked keys and source maps
-      --replay          replay captured writes with tampered fields
-      --allow-host <h>  extend the replay allowlist (repeatable)
+      --scan-bundles    (har) fetch the JS in the capture; look for leaked keys and source maps
+      --replay          (har) replay captured writes with tampered fields
+      --allow-host <h>  (har) extend the replay allowlist (repeatable)
   -q, --quiet           print only the output path
       --json            machine-readable summary, for CI
 ```
@@ -192,7 +235,8 @@ Each stage is pure and independently testable. `scripts/e2e.mjs` is the acceptan
 - [ ] OpenAPI → Postman collection and `curl` reproducers
 - [ ] Diff two captures: what changed between app versions
 - [ ] Optional MCP server so agents can query the reconstructed API
-- [ ] Source map downloading and original-source recovery
+- [ ] `web --browser`: drive Chromium once to build the HAR automatically
+- [ ] Download resolvable source maps and recover original sources
 
 ## License
 

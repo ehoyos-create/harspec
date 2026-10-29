@@ -166,6 +166,28 @@ async function main() {
 
     const product = await api.getProductsById(1);
     check('generated client substitutes path parameters', Number(product.id) === 1);
+
+    // ---- web mode: no HAR, no session -------------------------------------
+    console.log('  running static web mode…');
+    const webOut = join(OUT, 'web');
+    const web = await run('node', ['src/cli.ts', 'web', BASE, '-o', webOut, '--json']);
+    check('web mode exits 0', web.code === 0, web.stderr.slice(0, 300));
+
+    const webSummary = JSON.parse(web.stdout);
+    check('web mode reports an API surface', webSummary.apiPaths >= 5, String(webSummary.apiPaths));
+    check('web mode writes surface.md', existsSync(join(webOut, 'surface.md')));
+
+    const surface = readFileSync(join(webOut, 'surface.md'), 'utf8');
+    check('surface lists a discovered endpoint', surface.includes('/api/products'));
+    check('surface templates identifiers', surface.includes('/api/users/{id}'), surface.slice(0, 300));
+
+    const webOpenapi = JSON.parse(readFileSync(join(webOut, 'openapi.json'), 'utf8'));
+    check('skeleton spec is marked static', webOpenapi['x-harspec-mode'] === 'static');
+    check('skeleton spec has paths', Object.keys(webOpenapi.paths).length >= 5);
+
+    const webFindings = JSON.parse(readFileSync(join(webOut, 'findings.json'), 'utf8')).findings.map((f) => f.id);
+    check('web mode finds the leaked key', webFindings.some((id) => id.includes('secret/stripe')));
+    check('web mode confirms the source map', webFindings.some((id) => id.includes('sourcemap-confirmed')));
   } finally {
     server.kill('SIGTERM');
   }
