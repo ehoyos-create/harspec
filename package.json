@@ -13,6 +13,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build && node scripts/e2e.mjs",
     "dev": "node src/cli.ts",
     "demo:serve": "node demo/server.mjs",
     "demo:record": "node demo/record.mjs",

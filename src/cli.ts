@@ -476,6 +476,13 @@ async function runReproduce(args: Args): Promise<number> {
 
   const model = deriveAppModel(clusters, {
     name: args.title ?? deriveAppName(entries, label),
+    documents: entries
+      .filter((entry) => entry.kind === 'document' && entry.resText)
+      .map((entry) => ({
+        path: entry.pathname,
+        html: entry.resText,
+        title: entry.resText.match(/<title[^>]*>([^<]*)</i)?.[1]?.trim(),
+      })),
   });
 
   if (!model.collections.length) {

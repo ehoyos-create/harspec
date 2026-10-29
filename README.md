@@ -101,6 +101,11 @@ The UI adapts to the data: cards with images when records have a thumbnail or
 avatar, a table when they do not, a detail view with raw JSON, and a "Captured
 endpoints" page that lists the whole observed surface.
 
+Sites that render on the server and never call an API of their own — YouTube
+Music, plenty of Next.js pages — still produce an app: `harspec` reads the data
+embedded in the HTML (`__NEXT_DATA__`, escaped payloads, JSON islands) and treats
+it as a collection like any other.
+
 ## The rest of the pipeline
 
 Same capture, three more artifacts:
@@ -232,12 +237,13 @@ Real sites, no account, 2026-10-29:
 |---|---|---|
 | `calendly.com/rick` | `reproduce` | 2 resources, 1 real event type, app runs |
 | `www.hostinger.com` | `reproduce` | 10 products with prices and specs, app runs |
+| `music.youtube.com` | `reproduce` | 20 songs with artwork, read from data embedded in the page |
 | `vercel.com` | `web` | Next.js · 10 API paths · 76 routes |
 | `linear.app` | `web` | Next.js · 9 API paths · 40 routes |
 
 `npm run e2e` runs the whole thing against the included demo target: capture,
 spec, client (imported and called against the live API), report, and the generated
-app (booted and exercised over HTTP). 55 assertions.
+app (booted and exercised over HTTP). 57 assertions.
 
 ## Architecture
 

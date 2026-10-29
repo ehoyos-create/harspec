@@ -276,8 +276,9 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
     onProgress(`starting ${headless ? 'headless ' : ''}browser`);
     // Some builds (Arc, Dia, some Electron shells) refuse to start headless.
     // A windowed run still works and is quieter about it than failing.
+    let browserVersion = '';
     try {
-      await waitForDevTools(port, 15_000);
+      browserVersion = await waitForDevTools(port, 15_000);
     } catch (error) {
       if (!headless) throw error;
       onProgress('headless mode was refused, starting with a window');
@@ -287,7 +288,7 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
         // ignore
       }
       child = launch(false);
-      await waitForDevTools(port, 20_000);
+      browserVersion = await waitForDevTools(port, 20_000);
     }
     const target = await createTarget(port);
     const cdp = await Cdp.connect(target.webSocketDebuggerUrl);
@@ -375,6 +376,18 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
       maxResourceBufferSize: 10_000_000,
     });
 
+    // Headless browsers announce themselves ("HeadlessChrome/156"), and several
+    // large sites answer with "your browser is deprecated" instead of the app.
+    // We are a real Chromium; say so, and keep the version we actually run.
+    const major = browserVersion.match(/(\d+)\./)?.[1] ?? '126';
+    await cdp
+      .send('Network.setUserAgentOverride', {
+        userAgent: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`,
+        acceptLanguage: 'en-US,en;q=0.9',
+        platform: 'MacIntel',
+      })
+      .catch(() => {});
+
     onProgress(`navigating to ${url}`);
     await cdp.send('Page.navigate', { url });
 
@@ -391,6 +404,29 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
     };
 
     await settle();
+
+    // Consent walls (YouTube, most EU sites) hide the app behind a dialog.
+    // Click the obvious affirmative button, once, exactly like a person would.
+    const consent = await cdp
+      .send('Runtime.evaluate', {
+        returnByValue: true,
+        expression: `(() => {
+          const rx = /^(accept all|accept|i agree|agree|got it|aceptar todo|aceptar|accepter|tout accepter|alle akzeptieren|zustimmen|accetta tutto)$/i;
+          const candidates = [...document.querySelectorAll('button, [role="button"], a, input[type="submit"]')];
+          const target = candidates.find((node) => rx.test((node.innerText || node.value || '').trim()));
+          if (!target) return '';
+          target.click();
+          return (target.innerText || target.value || '').trim();
+        })()`,
+      })
+      .catch(() => null);
+
+    const consentLabel = consent?.result?.value;
+    if (consentLabel) {
+      onProgress(`dismissed a consent wall ("${String(consentLabel).slice(0, 24)}")`);
+      pageLoaded = false;
+      await settle(10_000);
+    }
 
     if (options.interactive) {
       // The person drives. harspec never sees or stores a password: if a login
@@ -469,12 +505,15 @@ async function waitForUser(seconds?: number): Promise<void> {
   });
 }
 
-async function waitForDevTools(port: number, timeoutMs: number): Promise<void> {
+async function waitForDevTools(port: number, timeoutMs: number): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1000) });
-      if (response.ok) return;
+      if (response.ok) {
+        const info = (await response.json()) as { Browser?: string };
+        return info.Browser ?? '';
+      }
     } catch {
       // not up yet
     }

@@ -271,6 +271,20 @@ async function main() {
     } finally {
       appProcess.kill('SIGTERM');
     }
+
+    // ---- server-rendered apps: data embedded in the HTML ------------------
+    const { embeddedPayloads } = await import('../src/reproduce.ts');
+    const fixture = `<html><head><title>Shop — Example</title>
+      <script type="application/ld+json">{"@type":"Organization","name":"Example"}</script>
+      <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"products":[
+        {"name":"Keyboard","price":10},{"name":"Mouse","price":5},{"name":"Screen","price":99}
+      ]}}}</script></head><body></body></html>`;
+    const payloads = embeddedPayloads(fixture, '/');
+    check('reads records embedded in the page HTML', payloads[0]?.items.length === 3, JSON.stringify(payloads.map((p) => p.items.length)));
+    check(
+      'ignores structured SEO metadata',
+      !payloads.some((p) => p.items.some((item) => item['@type'])),
+    );
   } finally {
     server.kill('SIGTERM');
   }

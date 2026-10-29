@@ -29,6 +29,7 @@ export interface Collection {
   wrapper?: string; // when the list response nests items under a key ('data.items')
   single?: boolean; // the endpoint returns one record, not a list
   readPost?: boolean; // the list is fetched with POST, not GET
+  page?: boolean; // records scraped out of the page HTML, not an API
   listTemplate: string;
   itemTemplate?: string;
 }
@@ -169,7 +170,14 @@ function asSingleRecord(body: any): any | undefined {
  * Anything else is an action: replayed with its captured response so the app
  * still behaves, even when we cannot model the semantics.
  */
-export function deriveAppModel(clusters: Cluster[], options: { name?: string; origin?: string } = {}): AppModel {
+export function deriveAppModel(
+  clusters: Cluster[],
+  options: {
+    name?: string;
+    origin?: string;
+    documents?: Array<{ path: string; html: string; title?: string }>;
+  } = {},
+): AppModel {
   const collections = new Map<string, Collection>();
   const actions: Action[] = [];
   const captured: AppModel['captured'] = [];
@@ -260,6 +268,32 @@ export function deriveAppModel(clusters: Cluster[], options: { name?: string; or
     }
   }
 
+  // Server-rendered pages: the data was in the HTML, never fetched.
+  // Done before field inference so these collections get schemas too.
+  for (const document of options.documents ?? []) {
+    if (!document.html) continue;
+    const payloads = embeddedPayloads(document.html, document.path);
+    if (!payloads.length) continue;
+
+    // One page can embed several payloads; take the richest one only.
+    const richest = payloads.sort((a, b) => b.items.length - a.items.length)[0];
+    const base = document.path === '/' ? '/__page/home' : `/__page${document.path}`;
+    if (collections.has(base)) continue;
+
+    const slug = document.path === '/' ? 'home' : document.path.split('/').filter(Boolean).pop() ?? 'page';
+    collections.set(base, {
+      key: base,
+      name: slug,
+      label: cleanPageTitle(document.title) ?? titleCase(slug),
+      items: richest.items,
+      fields: [],
+      wrapper: undefined,
+      single: false,
+      page: true,
+      listTemplate: base,
+    });
+  }
+
   // Dedupe items by identity when possible, then infer fields.
   for (const collection of collections.values()) {
     const byId = new Map<any, any>();
@@ -273,11 +307,15 @@ export function deriveAppModel(clusters: Cluster[], options: { name?: string; or
     collection.fields = deriveFields(collection.items);
     // Only treat it as a single-record resource when it really is one.
     collection.single = Boolean(collection.single) && collection.items.length === 1 && !collection.itemTemplate;
-    collection.label = titleCase(collection.single ? collection.name : pluralize(collection.name));
+    if (!collection.page) {
+      collection.label = titleCase(collection.single ? collection.name : pluralize(collection.name));
+    }
   }
 
   // Keep only collections that actually have data.
-  const usable = [...collections.values()].filter((c) => c.items.length > 0);
+  const usable = [...collections.values()]
+    .filter((c) => c.items.length > 0)
+    .filter((c) => !looksLikeTelemetry(c.items));
   usable.sort((a, b) => a.label.localeCompare(b.label));
 
   const sourceHost = primaryOrigin ?? clusters[0]?.origin ?? '';
@@ -297,6 +335,240 @@ export function deriveAppModel(clusters: Cluster[], options: { name?: string; or
 const SKIP_NAMES =
   /^(auth|login|logout|me|health|debug|search|admin|stats|env|metrics|config|settings|features|experiments|flags|track|analytics|ping|events|consent)$/i;
 const STATIC_PATH = /\.(js|mjs|json|css|map|png|jpe?g|gif|svg|ico|woff2?|ttf|txt|xml|webp|avif)$/i;
+
+/**
+ * Telemetry payloads look like records but carry no content: `{ service, params }`
+ * from a logging endpoint, `{ key, value }` from a config fetch. Showing them as
+ * a resource just makes the generated app look broken.
+ */
+function looksLikeTelemetry(items: any[]): boolean {
+  const telemetryKeys = new Set([
+    'service',
+    'params',
+    'key',
+    'value',
+    'trackingparams',
+    'clicktrackingparams',
+    'serializedcontextdata',
+  ]);
+
+  return items.every((item) => {
+    if (!isObject(item)) return false;
+    const keys = Object.keys(item);
+    if (keys.length === 0) return true;
+    if (!keys.every((key) => telemetryKeys.has(key.toLowerCase()))) return false;
+    // `{ key: "client.version", value: "1.2" }` is config; require some prose.
+    return !Object.values(item).some(
+      (value) => typeof value === 'string' && value.length > 12 && /\s/.test(value),
+    );
+  });
+}
+
+/** \"Hostinger - Bring Your Idea Online With a Website\" → \"Hostinger\". */
+function cleanPageTitle(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const parts = raw
+    .split(/\s+[|·—–-]\s+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 2 && part.length <= 48);
+  if (!parts.length) return undefined;
+  return parts.sort((a, b) => a.length - b.length)[0];
+}
+
+/**
+ * Server-rendered apps ship their data inside the HTML instead of fetching it:
+ * `__NEXT_DATA__`, `window.__INITIAL_STATE__`, or (YouTube) a JS string full of
+ * escaped JSON. If the page never called an API, this is the only data there is.
+ */
+export interface PagePayload {
+  path: string;
+  items: any[];
+}
+
+function decodeJsString(text: string): string {
+  let out = '';
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char !== '\\') {
+      out += char;
+      continue;
+    }
+    const next = text[i + 1];
+    if (next === 'x') {
+      out += String.fromCharCode(parseInt(text.slice(i + 2, i + 4), 16));
+      i += 3;
+    } else if (next === 'u') {
+      out += String.fromCharCode(parseInt(text.slice(i + 2, i + 6), 16));
+      i += 5;
+    } else if (next === 'n') {
+      out += '\n';
+      i += 1;
+    } else if (next === 't') {
+      out += '\t';
+      i += 1;
+    } else if (next === '\n') {
+      i += 1;
+    } else {
+      out += next;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function jsonCandidates(html: string): string[] {
+  const found: string[] = [];
+
+  // JSON-LD is SEO metadata about the page, not the app's data. Skip it.
+  for (const match of html.matchAll(/<script[^>]+type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi)) {
+    found.push(match[1]);
+  }
+
+  for (const match of html.matchAll(/JSON\.parse\(\s*(['"])([\s\S]{200,}?)\1\s*\)/g)) {
+    found.push(decodeJsString(match[2]));
+  }
+
+  // JS object literals whose values are giant escaped JSON strings, which is how
+  // YouTube Music and several other Polymer apps ship their first payload.
+  for (const match of html.matchAll(/(?:data|payload|initialData|__DATA__)\s*:\s*'((?:[^'\\]|\\.){500,}?)'/g)) {
+    found.push(decodeJsString(match[1]));
+  }
+
+  return found;
+}
+
+const NOISE_PATH = /(responsecontext|trackingparams|chipcloud|continuations|thumbnails|\bruns\b|params|header|metadata|menu|badge|overlay|button)/i;
+
+/** Deeply nested UI payloads (YouTube, Polymer apps) hide their text in renderers. */
+function flattenRecord(item: any): any {
+  if (!isObject(item)) return item;
+  const primitives = Object.values(item).filter((value) => typeof value !== 'object');
+  if (primitives.length >= 2) return item;
+
+  const texts: Array<{ text: string; score: number; order: number }> = [];
+  let image: string | undefined;
+  let visited = 0;
+  let order = 0;
+
+  const pathScore = (path: string[]): number => {
+    const joined = path.join('.').toLowerCase();
+    let score = 0;
+    if (/flexcolumns|primarytext|secondarytext|title|subtitle/.test(joined)) score += 5;
+    if (/runs|simpletext|text/.test(joined)) score += 2;
+    if (/accessibility|menu|overlay|button|tracking|tooltip|badge|header/.test(joined)) score -= 8;
+    score += Math.max(0, 4 - path.length);
+    return score;
+  };
+
+  const walk = (node: any, path: string[], depth: number) => {
+    if (visited > 900 || depth > 12 || node === null || node === undefined) return;
+    visited += 1;
+
+    if (typeof node === 'string') {
+      const where = path.join('.').toLowerCase();
+      const isUrl = /^https?:\/\//.test(node);
+      const looksLikeImage =
+        isUrl &&
+        (/\.(png|jpe?g|webp|avif|gif|svg)(\?|$)/i.test(node) ||
+          /(thumbnail|image|img|avatar|photo|cover|poster|logo|picture)/.test(where) ||
+          /(googleusercontent|cloudinary|imgix|imagekit|cloudfront)/.test(node));
+      if (looksLikeImage) {
+        if (!image) image = node;
+        return;
+      }
+      const last = path[path.length - 1] ?? '';
+      if (/^(text|simpleText)$/i.test(last) && node.length < 160) {
+        texts.push({ text: node, score: pathScore(path), order: order++ });
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.slice(0, 12).forEach((child, index) => walk(child, [...path, String(index)], depth + 1));
+      return;
+    }
+    if (!isObject(node)) return;
+
+    for (const [key, value] of Object.entries(node)) walk(value, [...path, key], depth + 1);
+  };
+
+  walk(item, [], 0);
+
+  const ranked = texts
+    .filter((entry) => entry.text.trim().length > 0)
+    .sort((a, b) => b.score - a.score || a.order - b.order);
+
+  const unique: string[] = [];
+  for (const entry of ranked) {
+    if (!unique.includes(entry.text)) unique.push(entry.text);
+    if (unique.length === 2) break;
+  }
+
+  const record: any = { title: unique[0] ?? '', subtitle: unique[1] ?? '' };
+  if (image) record.image = image;
+  return record;
+}
+
+function largestRecordList(root: any): any[] {
+  const stack: Array<{ node: any; path: string[] }> = [{ node: root, path: [] }];
+  let best: any[] = [];
+  let bestScore = 0;
+  let visited = 0;
+
+  while (stack.length && visited < 40_000) {
+    const { node, path } = stack.pop()!;
+    visited += 1;
+    if (path.length > 14) continue;
+
+    if (Array.isArray(node)) {
+      const records = node.filter((item) => isObject(item));
+      if (records.length >= 3 && !NOISE_PATH.test(path.join('.'))) {
+        // Single-key items are usually UI renderers wrapping one payload; give
+        // them a bonus so a shelf of 20 songs beats a list of 3 telemetry pings.
+        const value = records.reduce(
+          (total, item) => total + Math.min(Object.keys(item).length, 10) + (Object.keys(item).length === 1 ? 3 : 0),
+          0,
+        );
+        if (value > bestScore) {
+          best = records;
+          bestScore = value;
+        }
+      }
+      node.slice(0, 40).forEach((child, index) => stack.push({ node: child, path: [...path, String(index)] }));
+    } else if (isObject(node)) {
+      for (const [key, value] of Object.entries(node)) stack.push({ node: value, path: [...path, key] });
+    }
+  }
+
+  return best;
+}
+
+export function embeddedPayloads(html: string, path: string): PagePayload[] {
+  const payloads: PagePayload[] = [];
+
+  for (const candidate of jsonCandidates(html)) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+    const items = largestRecordList(parsed);
+    if (items.length >= 3) {
+      const flat = items
+        .map(flattenRecord)
+        .filter(
+          (item) =>
+            isObject(item) &&
+            Object.values(item).some((value) => typeof value === 'string' && value.trim().length >= 2),
+        );
+      // Frameworks embed plenty of plumbing (locale tables, router state) that
+      // flattens into empty shells. Only keep payloads that carry readable text.
+      if (flat.length >= 3) payloads.push({ path, items: flat.slice(0, 200) });
+    }
+  }
+
+  return payloads;
+}
 
 function pickPrimaryOrigin(clusters: Cluster[]): string | undefined {
   const counts = new Map<string, number>();
@@ -369,6 +641,7 @@ function generateServer(model: AppModel): string {
       wrapper: c.wrapper ?? null,
       single: Boolean(c.single),
       readPost: Boolean(c.readPost),
+      page: Boolean(c.page),
     })),
     actions: model.actions.map((a) => ({
       method: a.method,
@@ -481,6 +754,7 @@ const server = createServer(async (req, res) => {
         wrapper: c.wrapper,
         single: c.single,
         readPost: c.readPost,
+        page: c.page,
         records: (db.get(c.key) ?? []).length,
       })),
       actions: SEED.actions.map((a) => ({ method: a.method, template: a.template })),
@@ -1152,11 +1426,13 @@ async function renderCollection(collection) {
     el('div', { class: 'head' },
       el('div', {},
         el('h1', {}, collection.label ?? collection.name),
-        el('p', { class: 'sub' }, collection.key),
+        el('p', { class: 'sub' }, collection.page ? 'Embedded in the page, not fetched from an API' : collection.key),
       ),
       el('div', { class: 'head-actions' },
         meta,
-        el('button', { class: 'primary', onclick: () => openCreate(collection) }, 'New'),
+        collection.page
+          ? ''
+          : el('button', { class: 'primary', onclick: () => openCreate(collection) }, 'New'),
       ),
     ),
     el('div', { class: 'toolbar' }, search),
