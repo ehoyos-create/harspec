@@ -184,19 +184,25 @@ async function runCapture(cdp: Cdp, browserVersion: string, url: string, options
     await settle();
 
     // Consent walls (YouTube, most EU sites) hide the app behind a dialog.
-    // Click the obvious affirmative button, once, exactly like a person would.
+    // Prefer the privacy-preserving button when there is one, then accept,
+    // exactly like a person who wants to see the page would.
+    const consentExpression = `(() => {
+      const decline = /^(reject all|reject|decline|decline all|only necessary|necessary only|essential only|rechazar|rechazar todo|solo necesarias|refuser|tout refuser|ablehnen|rifiuta|recusar)$/i;
+      const accept = /^(accept all|accept|i agree|agree|got it|i understand|ok|okay|aceptar todo|aceptar|entendido|accepter|tout accepter|j'ai compris|alle akzeptieren|zustimmen|verstanden|accetta tutto|ho capito|entendi)$/i;
+      const candidates = [...document.querySelectorAll('button, [role="button"], a, input[type="submit"]')]
+        .filter((node) => {
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+      const label = (node) => (node.innerText || node.value || '').trim();
+      const target = candidates.find((node) => decline.test(label(node))) || candidates.find((node) => accept.test(label(node)));
+      if (!target) return '';
+      target.click();
+      return label(target);
+    })()`;
+
     const consent = await cdp
-      .send('Runtime.evaluate', {
-        returnByValue: true,
-        expression: `(() => {
-          const rx = /^(accept all|accept|i agree|agree|got it|aceptar todo|aceptar|accepter|tout accepter|alle akzeptieren|zustimmen|accetta tutto)$/i;
-          const candidates = [...document.querySelectorAll('button, [role="button"], a, input[type="submit"]')];
-          const target = candidates.find((node) => rx.test((node.innerText || node.value || '').trim()));
-          if (!target) return '';
-          target.click();
-          return (target.innerText || target.value || '').trim();
-        })()`,
-      })
+      .send('Runtime.evaluate', { returnByValue: true, expression: consentExpression })
       .catch(() => null);
 
     const consentLabel = consent?.result?.value;

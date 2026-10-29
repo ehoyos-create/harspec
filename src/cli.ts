@@ -693,6 +693,18 @@ async function runBrief(args: Args): Promise<number> {
       height: Math.min(evidence.meta.viewport.height, evidence.screenshot.height ?? 900),
     });
     screenshots = { full: raster.full, viewport: raster.viewport };
+  } else if (evidence?.screenshot?.full) {
+    // The compositor already gave us a PNG; write it as-is.
+    const dir = join(outDir, 'evidence');
+    mkdirSync(dir, { recursive: true });
+    const full = join(dir, 'screenshot.png');
+    writeFileSync(full, Buffer.from(evidence.screenshot.full, 'base64'));
+    let viewport: string | undefined;
+    if (evidence.screenshot.viewportBase64) {
+      viewport = join(dir, 'viewport.png');
+      writeFileSync(viewport, Buffer.from(evidence.screenshot.viewportBase64, 'base64'));
+    }
+    screenshots = { full, viewport };
   }
   // A screenshot of the first screen beats a crop of the tall image: the crop
   // is where fixed headers and sidebars disappear.

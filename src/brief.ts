@@ -472,7 +472,16 @@ export interface Evidence {
   tokens: Record<string, any>;
   header: any;
   sections?: any[];
-  screenshot?: { full?: string; viewport?: string; viewportBase64?: string; pdf?: string; note?: string; width?: number; height?: number };
+  screenshot?: {
+    full?: string;
+    viewport?: string;
+    viewportBase64?: string;
+    pdf?: string;
+    note?: string;
+    width?: number;
+    height?: number;
+    from?: 'compositor' | 'pdf';
+  };
 }
 
 /** Read the rendered page: layout tree, styles, tokens, interactions. */
@@ -552,8 +561,22 @@ export async function observePage(
   onProgress: (message: string) => void = () => {},
   options: { screenshot?: boolean; scroll?: boolean } = {},
 ): Promise<Evidence> {
+  // The window is not always the size we asked for: a stray restore or a
+  // failed metrics call can leave it portrait, and then every measurement and
+  // the screenshot inherit the mistake. Pin it once, up front.
+  const viewport = await evaluate<{ width: number; height: number }>(
+    cdp,
+    '({ width: window.innerWidth, height: window.innerHeight })',
+  ).catch(() => ({ width: 0, height: 0 }));
+  if (Math.abs(viewport.width - 1440) > 4 || Math.abs(viewport.height - 900) > 4) {
+    onProgress(`pinning the viewport to 1440x900 (found ${viewport.width}x${viewport.height})`);
+    await pinViewport(cdp, 1440, 900);
+    await sleep(600);
+  }
+
   onProgress('waiting for the page to settle');
   await settleRender(cdp);
+  await dismissConsent(cdp, onProgress);
   await waitForContent(cdp);
 
   // Scroll only once the app has rendered. Hammering scroll events while a
@@ -632,6 +655,30 @@ export async function settleRender(cdp: Cdp, maxMs = 20_000): Promise<number> {
   return current;
 }
 
+/**
+ * A cookie banner is not part of the app, but it sits on top of it in every
+ * screenshot. Click the quiet option once, like a person would.
+ */
+export async function dismissConsent(cdp: Cdp, onProgress: (message: string) => void = () => {}): Promise<void> {
+  const expression = `(() => {
+    const decline = /^(reject all|reject|decline|decline all|only necessary|necessary only|essential only|rechazar|rechazar todo|solo necesarias|refuser|tout refuser|ablehnen|rifiuta|recusar)$/i;
+    const accept = /^(accept all|accept|i agree|agree|got it|i understand|ok|okay|aceptar todo|aceptar|entendido|accepter|tout accepter|alle akzeptieren|zustimmen|accetta tutto|entendi)$/i;
+    const candidates = [...document.querySelectorAll('button, [role="button"], a, input[type="submit"]')]
+      .filter((node) => { const r = node.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+    const label = (node) => (node.innerText || node.value || '').trim();
+    const target = candidates.find((node) => decline.test(label(node))) || candidates.find((node) => accept.test(label(node)));
+    if (!target) return '';
+    target.click();
+    return label(target);
+  })()`;
+
+  const result = await evaluate<string>(cdp, expression).catch(() => '');
+  if (!result) return;
+  onProgress(`dismissed a consent wall ("${String(result).slice(0, 24)}")`);
+  await sleep(800);
+  await settleRender(cdp, 5_000);
+}
+
 /** Rough signal that the app painted something, not just its chrome. */
 async function waitForContent(cdp: Cdp, maxMs = 10_000): Promise<void> {
   const deadline = Date.now() + maxMs;
@@ -666,24 +713,39 @@ async function evaluate<T>(cdp: Cdp, expression: string, timeoutMs = 20_000): Pr
  * screenshot is the fallback.
  */
 async function captureImage(cdp: Cdp, evidence: Evidence): Promise<Evidence['screenshot']> {
-  const width = Math.max(320, Math.round(evidence.meta.document?.width ?? 1440));
-  const tall = Math.max(320, Math.round(evidence.meta.document?.height ?? 900));
+  // Some pages report a scroll width narrower than the window (a scaled or
+  // centred shell). The image should be the window a person saw, not the
+  // smallest box the document claims.
+  const viewportWidth = Math.round(evidence.meta.viewport?.width ?? 0) || 0;
+  const viewportHeight = Math.round(evidence.meta.viewport?.height ?? 0) || 0;
+  const width = Math.max(320, Math.round(evidence.meta.document?.width ?? 1440), viewportWidth);
+  const tall = Math.max(320, Math.round(evidence.meta.document?.height ?? 900), viewportHeight);
+
+  // The compositor gives a pixel-accurate shot of the window. Use it always:
+  // it is the image that matches the measurements, and it is what a person
+  // compares against when checking fidelity.
+  const viewportShot = await cdp
+    .send('Page.captureScreenshot', { format: 'png', fromSurface: true })
+    .catch(() => null);
+
+  // A page that fits in one screen needs nothing else.
+  if (tall <= viewportHeight + 50 && viewportShot?.data) {
+    return {
+      full: viewportShot.data,
+      width: viewportWidth || width,
+      height: viewportHeight || tall,
+      from: 'compositor',
+    } as any;
+  }
+
   // A PDF page tops out at 200 inches. Past that we scale down instead of
   // paginating, because a cut page is worse evidence than a smaller one.
   const limit = 14_400;
   const scale = tall > limit ? limit / tall : 1;
   const height = Math.round(tall * scale);
 
-  // Print media applies a print stylesheet; "screen" keeps what the person saw.
   await cdp.send('Emulation.setEmulatedMedia', { media: 'screen' }).catch(() => {});
-  await sleep(400);
-
-  // The first screen is captured by the compositor, not by the PDF engine:
-  // cropping the tall image afterwards is where "the header is missing" came
-  // from, because the fixed bars only exist in a real viewport shot.
-  const firstScreen = await cdp
-    .send('Page.captureScreenshot', { format: 'png', fromSurface: true })
-    .catch(() => null);
+  await sleep(300);
 
   const pdf = await cdp
     .send('Page.printToPDF', {
@@ -704,15 +766,18 @@ async function captureImage(cdp: Cdp, evidence: Evidence): Promise<Evidence['scr
       pdf: Buffer.from(pdf.data, 'base64').toString('base64'),
       width,
       height,
-      viewportBase64: firstScreen?.data,
-    };
+      viewportBase64: viewportShot?.data,
+    } as any;
   }
 
-  const shot = await cdp
-    .send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true })
+  const beyond = await cdp
+    .send('Page.captureScreenshot', { format: 'png', fromSurface: true, captureBeyondViewport: true })
     .catch(() => null);
-  if (shot?.data) return { full: shot.data, viewportBase64: firstScreen?.data };
-  throw new Error('this browser refused both PDF and screenshot capture');
+  if (beyond?.data) return { full: beyond.data, viewportBase64: viewportShot?.data } as any;
+  if (viewportShot?.data) {
+    return { full: viewportShot.data, note: 'only the visible screen could be captured', width: viewportWidth, height: viewportHeight } as any;
+  }
+  throw new Error('this browser refused every screenshot method');
 }
 
 /**
