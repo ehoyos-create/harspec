@@ -20,6 +20,12 @@ tests without authorisation can be a criminal offence regardless of intent.
 
 ## What it does when you opt in
 
+- `capture <url>` opens your own local browser and records the traffic of that
+  visit, exactly as DevTools' Network panel would. It uses your machine and your
+  network; it does not defeat bot protection, and it does not touch credentials.
+- `--interactive` keeps that browser visible so you drive it yourself. If the site
+  needs a login, you log in — the password goes to the site, never to `harspec`.
+- `reproduce <url>` is `capture` followed by generation, in one step.
 - `--scan-bundles` performs `GET` requests for JavaScript files that already
   appear in your capture, plus any source map they reference. Same origin, same
   resources your browser loaded.
@@ -33,6 +39,31 @@ test that host. Do not extend it for third-party systems you do not control.
 Replaying a tampered write against a production service you do not own is
 unauthorised testing. It can corrupt data, trigger fraud controls, or violate the
 target's terms of service.
+
+## Generated apps are not copies
+
+`reproduce` does not redistribute the target's work. It emits original source
+code — a new server, a new UI, a new stylesheet — derived from observable facts:
+which resources exist, what fields they carry, and what a real response looked
+like. No HTML, CSS, JavaScript, fonts, images or copy from the target are copied
+or bundled.
+
+That does not make every use acceptable. Publishing a generated app is still
+subject to:
+
+- **Trademark.** Do not ship the target's name, logo, or confusingly similar
+  branding. Rename it.
+- **Copyright in data and content.** Records captured from a page may contain
+  text, images or user content owned by someone else. Do not republish content you
+  have no right to.
+- **Terms of service and contract.** Automated access may be restricted even when
+  the data is public.
+- **Privacy.** Captured records can contain personal data. Delete what you do not
+  need.
+
+Use it to understand an interface, rebuild something you own, keep a dead app
+alive, or learn how a product you admire is put together. Do not use it to pass
+off someone else's product as yours.
 
 ## Credentials
 

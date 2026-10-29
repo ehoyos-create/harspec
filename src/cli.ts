@@ -9,11 +9,13 @@
  * The core is deterministic: same input in, same files out. No model calls.
  */
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { captureSession, harFromEntries } from './capture.ts';
 import { buildClient } from './client.ts';
 import { clusterEntries, readHar, type Entry } from './har.ts';
 import { buildOpenApi, summariseDocument } from './openapi.ts';
+import { appSummary, deriveAppModel, writeApp } from './reproduce.ts';
 import { passiveFindings, renderReportMarkdown, severityRank, type Finding } from './report.ts';
 import { activeFindings } from './replay.ts';
 import { scanBundles } from './scan.ts';
@@ -24,13 +26,15 @@ import { toYaml } from './yaml.ts';
 const VERSION = '0.1.0';
 
 interface Args {
-  mode: 'har' | 'web';
+  mode: 'har' | 'web' | 'reproduce' | 'capture';
   input?: string;
   out: string;
   title?: string;
   replay: boolean;
   allowHosts: string[];
   scanBundles: boolean;
+  interactive: boolean;
+  seconds?: number;
   quiet: boolean;
   json: boolean;
   help: boolean;
@@ -44,6 +48,7 @@ function parseArgs(argv: string[]): Args {
     replay: false,
     allowHosts: [],
     scanBundles: false,
+    interactive: false,
     quiet: false,
     json: false,
     help: false,
@@ -53,6 +58,12 @@ function parseArgs(argv: string[]): Args {
   let rest = argv;
   if (rest[0] === 'web') {
     args.mode = 'web';
+    rest = rest.slice(1);
+  } else if (rest[0] === 'reproduce') {
+    args.mode = 'reproduce';
+    rest = rest.slice(1);
+  } else if (rest[0] === 'capture') {
+    args.mode = 'capture';
     rest = rest.slice(1);
   }
 
@@ -66,6 +77,8 @@ function parseArgs(argv: string[]): Args {
     else if (arg === '--replay') args.replay = true;
     else if (arg === '--allow-host') args.allowHosts.push(rest[++i] ?? '');
     else if (arg === '--scan-bundles') args.scanBundles = true;
+    else if (arg === '--interactive' || arg === '-i') args.interactive = true;
+    else if (arg === '--seconds') args.seconds = Number(rest[++i] ?? 0) || undefined;
     else if (arg === '--quiet' || arg === '-q') args.quiet = true;
     else if (arg === '--json') args.json = true;
     else if (arg.startsWith('-')) throw new Error(`Unknown option: ${arg}`);
@@ -84,10 +97,14 @@ function help(): string {
     '  Usage',
     '    harspec <capture.har> [options]      full pipeline from recorded traffic',
     '    harspec web <url> [options]          public surface, no session, no browser',
+    '    harspec capture <url> [options]      drive your local browser, write a HAR',
+    '    harspec reproduce <url|har>          generate a standalone app from the capture',
     '',
     '  Options',
     '    -o, --out <dir>        Output directory (default: ./harspec-out)',
-    '        --title <text>     API title used in the spec',
+    '        --title <text>     Name for the generated app / API title',
+    '    -i, --interactive      Open a visible browser and record while you use it',
+    '        --seconds <n>      Hard stop for interactive capture (default: 300)',
     '        --scan-bundles     (har) Fetch the JS in the capture and scan it',
     '        --replay           (har) Replay captured writes with tampered fields (localhost by default)',
     '        --allow-host <h>   (har) Extend the replay allowlist (repeatable)',
@@ -96,12 +113,16 @@ function help(): string {
     '    -v, --version          Print version',
     '    -h, --help             Print this help',
     '',
-    '  Two modes, one honest difference',
-    '    web     Reads the HTML and JavaScript any anonymous visitor receives.',
-    '            Finds endpoints, routes and leaked secrets. No schemas, because',
-    '            it never calls the API.',
-    '    har     Reads a capture of a real session, including authenticated calls.',
-    '            Infers schemas and emits a typed client that actually runs.',
+    '  Modes',
+    '    reproduce  A URL or a HAR goes in; a standalone app comes out. Own server,',
+    '               own UI, seeded from the capture. Nothing from the target is copied.',
+    '    capture    Drives a local Chromium browser over the DevTools protocol and',
+    '               writes a HAR. Use --interactive to browse and log in yourself.',
+    '    web        Reads the HTML and JavaScript any anonymous visitor receives.',
+    '               Finds endpoints, routes and leaked secrets. No schemas, because',
+    '               it never calls the API.',
+    '    har        Reads a capture of a real session, including authenticated calls.',
+    '               Infers schemas, emits a typed client, and can generate an app.',
     '',
     '  How to capture a HAR',
     '    Chrome / Edge: DevTools → Network → right click → "Save all as HAR with content"',
@@ -109,6 +130,9 @@ function help(): string {
     '    Safari:        Network → Export',
     '',
     '  Examples',
+    '    harspec reproduce https://calendly.com/rick -o my-app',
+    '    harspec reproduce https://example.com --interactive',
+    '    harspec capture https://example.com -o session.har',
     '    harspec web https://app.example.com',
     '    harspec session.har --scan-bundles --replay',
     '',
@@ -379,6 +403,176 @@ async function runWeb(args: Args): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// Reproduce: capture → standalone app
+// ---------------------------------------------------------------------------
+
+async function loadEntries(args: Args, quiet: boolean): Promise<{ entries: Entry[]; label: string }> {
+  const input = args.input as string;
+
+  if (/^https?:\/\//i.test(input)) {
+    const entries = await captureSession(input, {
+      interactive: args.interactive,
+      seconds: args.seconds,
+      onProgress: quiet ? undefined : (m) => console.log(dim(`  ${m}`)),
+    });
+    return { entries, label: input };
+  }
+
+  const path = resolve(input);
+  if (!existsSync(path)) throw new Error(`no such file: ${path}`);
+  const entries = readHar(path);
+  return { entries, label: entries[0]?.host ?? path };
+}
+
+function deriveAppName(entries: Entry[], fallbackHost: string): string {
+  const document = entries.find((e) => e.kind === 'document' && e.resText);
+  const raw = document?.resText.match(/<title[^>]*>([^<]*)</i)?.[1]?.trim() ?? '';
+
+  // Titles are marketing copy: "Rick Pollak | Calendly" → "Rick Pollak".
+  const cleaned = raw
+    .split(/\s+[|·—–-]\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)[0];
+
+  const brand = fallbackHost
+    .replace(/^https?:\/\//, '')
+    .split('/')[0]
+    .split(':')[0]
+    .replace(/^www\./, '')
+    .split('.')[0];
+
+  const title = (cleaned ?? raw).replace(/\s+/g, ' ').trim();
+
+  // A long headline ("Bring Your Idea Online With a Website") is not an app
+  // name; the brand is the more useful default.
+  if (title && title.length <= 32) return title;
+  if (brand) return brand.charAt(0).toUpperCase() + brand.slice(1);
+  return 'Rebuilt App';
+}
+
+async function runReproduce(args: Args): Promise<number> {
+  const quiet = args.quiet || args.json;
+
+  if (!quiet) {
+    console.log('');
+    console.log(`${bold('harspec')} ${dim(`v${VERSION} · reproduce`)}`);
+  }
+
+  let loaded: { entries: Entry[]; label: string };
+  try {
+    loaded = await loadEntries(args, quiet);
+  } catch (error: any) {
+    console.error(red(`error: ${error.message}`));
+    return 1;
+  }
+
+  const { entries, label } = loaded;
+  const clusters = clusterEntries(entries);
+  if (!clusters.length) {
+    console.error(red('error: no API requests found in the capture'));
+    return 1;
+  }
+
+  const model = deriveAppModel(clusters, {
+    name: args.title ?? deriveAppName(entries, label),
+  });
+
+  if (!model.collections.length) {
+    console.error(red('error: no resources with data were found, so there is nothing to rebuild'));
+    console.error(dim('  the capture has endpoints, but none returned records we could model'));
+    return 1;
+  }
+
+  const outDir = resolve(args.out);
+  mkdirSync(outDir, { recursive: true });
+  writeApp(model, outDir);
+
+  if (args.json) {
+    console.log(
+      JSON.stringify(
+        {
+          mode: 'reproduce',
+          app: model.name,
+          out: outDir,
+          source: label,
+          collections: model.collections.map((c) => ({ key: c.key, records: c.items.length })),
+          actions: model.actions.length,
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  if (args.quiet) {
+    console.log(outDir);
+    return 0;
+  }
+
+  console.log(`${dim('source   ')} ${label}`);
+  console.log(`${dim('app      ')} ${model.name}`);
+  console.log('');
+  console.log(appSummary(model));
+  console.log('');
+  console.log(`${green('✓')} server.mjs      ${dim('own backend, seeded from the capture')}`);
+  console.log(`${green('✓')} public/         ${dim('own UI, no framework, no dependencies')}`);
+  console.log(`${green('✓')} README.md`);
+  console.log('');
+  console.log(`  run it:  ${bold(`cd ${outDir} && npm start`)}`);
+  console.log(dim('  original code only: nothing from the target was copied'));
+  console.log('');
+
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Capture: drive a local browser, write a HAR
+// ---------------------------------------------------------------------------
+
+async function runCapture(args: Args): Promise<number> {
+  const quiet = args.quiet || args.json;
+  const target = args.input as string;
+
+  if (!/^https?:\/\//i.test(target)) {
+    console.error(red('error: capture needs an http(s) URL'));
+    return 1;
+  }
+
+  try {
+    const entries = await captureSession(target, {
+      interactive: args.interactive,
+      seconds: args.seconds,
+      onProgress: quiet ? undefined : (m) => console.log(dim(`  ${m}`)),
+    });
+
+    const outFile = args.out.endsWith('.har') ? args.out : join(args.out, 'session.har');
+    mkdirSync(resolve(outFile, '..'), { recursive: true });
+
+    writeFileSync(resolve(outFile), `${JSON.stringify(harFromEntries(entries, VERSION), null, 2)}\n`);
+
+    if (args.json) {
+      console.log(JSON.stringify({ mode: 'capture', target, out: resolve(outFile), requests: entries.length }, null, 2));
+      return 0;
+    }
+    if (args.quiet) {
+      console.log(resolve(outFile));
+      return 0;
+    }
+
+    console.log('');
+    console.log(`${green('✓')} captured ${plural(entries.length, 'request', 'requests')} → ${dim(outFile)}`);
+    console.log(dim(`  next: harspec ${outFile}`));
+    console.log('');
+    return 0;
+  } catch (error: any) {
+    console.error(red(`error: ${error.message}`));
+    return 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<number> {
   let args: Args;
@@ -403,7 +597,13 @@ async function main(): Promise<number> {
     return 1;
   }
 
-  return args.mode === 'web' ? runWeb(args) : runHar(args);
+  return args.mode === 'web'
+    ? runWeb(args)
+    : args.mode === 'reproduce'
+      ? runReproduce(args)
+      : args.mode === 'capture'
+        ? runCapture(args)
+        : runHar(args);
 }
 
 main()

@@ -49,6 +49,20 @@ function run(command, args, options = {}) {
   });
 }
 
+async function waitFor(base, path, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`${base}${path}`);
+      if (response.ok) return true;
+    } catch {
+      // not up yet
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
+}
+
 async function waitForServer(timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -188,6 +202,75 @@ async function main() {
     const webFindings = JSON.parse(readFileSync(join(webOut, 'findings.json'), 'utf8')).findings.map((f) => f.id);
     check('web mode finds the leaked key', webFindings.some((id) => id.includes('secret/stripe')));
     check('web mode confirms the source map', webFindings.some((id) => id.includes('sourcemap-confirmed')));
+
+    // ---- reproduce: capture → standalone app ------------------------------
+    console.log('  generating a standalone app from the capture…');
+    const appOut = join(OUT, 'app');
+    const app = await run('node', ['src/cli.ts', 'reproduce', HAR, '-o', appOut, '--json']);
+    check('reproduce exits 0', app.code === 0, app.stderr.slice(0, 400));
+
+    const appSummaryJson = JSON.parse(app.stdout);
+    const appCollections = appSummaryJson.collections ?? [];
+    check('reproduce finds resources', appCollections.length >= 3, JSON.stringify(appCollections));
+    check(
+      'reproduce keeps the product records',
+      (appCollections.find((c) => c.key === '/api/products')?.records ?? 0) >= 4,
+      JSON.stringify(appCollections),
+    );
+    check('generated server written', existsSync(join(appOut, 'server.mjs')));
+    check('generated ui written', existsSync(join(appOut, 'public', 'index.html')));
+
+    const generatedServer = readFileSync(join(appOut, 'server.mjs'), 'utf8');
+    check('generated server has no dependencies', !/^import .* from '(?!node:)/m.test(generatedServer));
+
+    const generatedUi = readFileSync(join(appOut, 'public', 'index.html'), 'utf8');
+    const targetHtml = readFileSync(join(ROOT, 'demo', 'public', 'index.html'), 'utf8');
+    check(
+      'generated app contains no source markup',
+      !generatedUi.includes('Demo Shop</h1>') &&
+        !generatedUi.includes('Intentionally vulnerable target') &&
+        targetHtml.includes('Intentionally vulnerable target'),
+    );
+
+    const appPort = PORT + 1;
+    const appProcess = spawn('node', ['server.mjs'], {
+      cwd: appOut,
+      env: { ...process.env, PORT: String(appPort) },
+      stdio: 'ignore',
+    });
+
+    try {
+      const appBase = `http://localhost:${appPort}`;
+      const appReady = await waitFor(appBase, '/__meta');
+      check('generated app boots', appReady);
+
+      const meta = await (await fetch(`${appBase}/__meta`)).json();
+      check('generated app exposes its model', Array.isArray(meta.collections) && meta.collections.length >= 3);
+
+      const list = await (await fetch(`${appBase}/api/products?limit=2`)).json();
+      const listItems = Array.isArray(list) ? list : (list.items ?? []);
+      check('generated app serves seeded records', listItems.length === 2, JSON.stringify(list).slice(0, 160));
+
+      const created = await (
+        await fetch(`${appBase}/api/products`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name: 'Rebuilt Widget', price: 9.5 }),
+        })
+      ).json();
+      check('generated app creates records', typeof created.id === 'number' && created.name === 'Rebuilt Widget');
+
+      const fetched = await (await fetch(`${appBase}/api/products/${created.id}`)).json();
+      check('generated app reads records back', fetched.name === 'Rebuilt Widget');
+
+      const deleted = await fetch(`${appBase}/api/products/${created.id}`, { method: 'DELETE' });
+      check('generated app deletes records', deleted.ok);
+
+      const html = await (await fetch(appBase)).text();
+      check('generated app serves its own ui', html.includes('<!doctype html>') && html.includes('/app.js'));
+    } finally {
+      appProcess.kill('SIGTERM');
+    }
   } finally {
     server.kill('SIGTERM');
   }

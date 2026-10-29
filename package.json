@@ -1,7 +1,7 @@
 {
   "name": "harspec",
   "version": "0.1.0",
-  "description": "Turn any web app's traffic into an OpenAPI spec, a typed TypeScript client, and a risk report. Zero dependencies.",
+  "description": "Point it at a web app and get a working copy you own: spec, typed client, and a runnable app generated from the traffic. Zero dependencies.",
   "type": "module",
   "bin": {
     "harspec": "./dist/cli.js"
@@ -25,9 +25,12 @@
     "har",
     "openapi",
     "reverse-engineering",
+    "app-generator",
+    "codegen",
     "api",
     "security",
-    "spa"
+    "spa",
+    "devtools"
   ],
   "license": "MIT",
   "devDependencies": {
