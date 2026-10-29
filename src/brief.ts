@@ -129,7 +129,7 @@ const PROBE = `(() => {
   var nodes = [];
   var count = 0;
 
-  function walk(el, depth, parentIndex, parentStyle) {
+  function walk(el, depth, parentIndex, parentStyle, region) {
     if (count >= MAX) return null;
     if (SKIP[el.tagName]) return null;
     var cs = window.getComputedStyle(el);
@@ -137,19 +137,32 @@ const PROBE = `(() => {
     var rect = el.getBoundingClientRect();
     var measurable = rect.width >= 1 && rect.height >= 1;
 
+    // Which landmark an element lives in decides whether it is content or
+    // chrome. A repeated nav entry and a repeated card look identical to a
+    // shape detector, and only one of them belongs in the content outline.
+    var tagName = el.tagName.toLowerCase();
+    var landmarkRole = el.getAttribute('role');
+    var here =
+      tagName === 'nav' || tagName === 'aside' || tagName === 'header' || tagName === 'footer' ||
+      landmarkRole === 'navigation' || landmarkRole === 'complementary'
+        ? tagName === 'header' || tagName === 'footer' ? tagName : 'nav'
+        : null;
+    var inRegion = here || region;
+
     var node = measurable
-      ? { i: count++, depth: depth, tag: el.tagName.toLowerCase() }
+      ? { i: count++, depth: depth, tag: tagName }
       : null;
     if (!node) {
       // Not recordable, but its children may still be: descend with the same
       // parent so the tree stays connected.
       var shared = el.shadowRoot || el;
       for (var bare = shared.firstElementChild; bare; bare = bare.nextElementSibling) {
-        walk(bare, depth, parentIndex, parentStyle);
+        walk(bare, depth, parentIndex, parentStyle, inRegion);
       }
       return null;
     }
     if (parentIndex >= 0) node.parent = parentIndex;
+    if (here) node.region = here;
 
     var text = textOf(el);
     if (text) {
@@ -215,13 +228,13 @@ const PROBE = `(() => {
     // this tool exists to avoid.
     var host = el.shadowRoot || el;
     for (var c = host.firstElementChild; c; c = c.nextElementSibling) {
-      walk(c, depth + 1, node.i, merged);
+      walk(c, depth + 1, node.i, merged, inRegion);
     }
     void at;
     return node;
   }
 
-  if (document.body) walk(document.body, 0, -1, null);
+  if (document.body) walk(document.body, 0, -1, null, null);
 
   // Design tokens that the app declares for itself are the cheapest fidelity
   // win there is: a palette of names the site already uses.
@@ -345,8 +358,12 @@ const PROBE = `(() => {
       var cand = nodes[c2];
       if (cand.i >= rp.sample || !cand.text || (cand.fs || 0) < 15) continue;
       var gap = box[1] - cand.box[1];
-      if (gap < 0 || gap > 220) continue;
-      if (Math.abs(cand.box[0] - box[0]) > 420) continue;
+      if (gap < 0 || gap > 120) continue;
+      // A heading sits on the same left edge as the cards it names. Anything
+      // further away is chrome that happens to be above it (a nav label, a
+      // promo banner), and picking it is how "Explore" ends up as the title of
+      // a music shelf.
+      if (Math.abs(cand.box[0] - box[0]) > 120) continue;
       if (inside(c2, rp.sample)) continue;
       if (cand.i > bestI) {
         bestI = cand.i;
@@ -367,14 +384,46 @@ const PROBE = `(() => {
     }
     sections.push({
       title: title || null,
+      region: regionOf(rp.sample),
       itemCount: rp.count,
       kind: nodes[rp.sample].tag + (nodes[rp.sample].role ? '[role=' + nodes[rp.sample].role + ']' : ''),
       box: box,
       items: items
     });
   }
-  evidence.sections = sections
-    .filter(function (x) { return x.title || x.items.length > 2; })
+  function regionOf(idx) {
+    var cur = nodes[idx];
+    while (cur) {
+      if (cur.region) return cur.region;
+      cur = cur.parent === undefined ? null : nodes[cur.parent];
+    }
+    return null;
+  }
+
+  var kept = sections.filter(function (x) { return x.title || x.items.length > 2; });
+  // Navigation, sidebars and footers are controls, not content: they are
+  // already in interactions.json. Listing them as sections makes a rebuild
+  // build three fake card rows at the top of the page.
+  kept = kept.filter(function (x) { return x.region !== 'nav' && x.region !== 'header' && x.region !== 'footer'; });
+  // A container (a shelf, a carousel) and the cards inside it both look like
+  // repeats, and listing both describes the page twice. Keep the inner one:
+  // the cards are what a rebuild needs, the shelf is already their box.
+  kept = kept.filter(function (a) {
+    for (var b2 = 0; b2 < kept.length; b2++) {
+      var other = kept[b2];
+      if (other === a) continue;
+      if (
+        other.box[0] >= a.box[0] &&
+        other.box[1] >= a.box[1] &&
+        other.box[0] + other.box[2] <= a.box[0] + a.box[2] &&
+        other.box[1] + other.box[3] <= a.box[1] + a.box[3]
+      ) {
+        return false;
+      }
+    }
+    return true;
+  });
+  evidence.sections = kept
     .sort(function (a, b) { return a.box[1] - b.box[1]; })
     .slice(0, 14);
 
