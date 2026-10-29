@@ -16,6 +16,13 @@ import { buildClient } from './client.ts';
 import { clusterEntries, readHar, type Entry } from './har.ts';
 import { buildOpenApi, summariseDocument } from './openapi.ts';
 import { appSummary, deriveAppModel, writeApp } from './reproduce.ts';
+import {
+  observePage,
+  rasterise,
+  summariseEvidence,
+  writeBriefPack,
+  type Evidence,
+} from './brief.ts';
 import { passiveFindings, renderReportMarkdown, severityRank, type Finding } from './report.ts';
 import { activeFindings } from './replay.ts';
 import { scanBundles } from './scan.ts';
@@ -26,7 +33,7 @@ import { toYaml } from './yaml.ts';
 const VERSION = '0.1.0';
 
 interface Args {
-  mode: 'har' | 'web' | 'reproduce' | 'capture';
+  mode: 'har' | 'web' | 'reproduce' | 'capture' | 'brief';
   input?: string;
   out: string;
   title?: string;
@@ -65,6 +72,9 @@ function parseArgs(argv: string[]): Args {
   } else if (rest[0] === 'capture') {
     args.mode = 'capture';
     rest = rest.slice(1);
+  } else if (rest[0] === 'brief') {
+    args.mode = 'brief';
+    rest = rest.slice(1);
   }
 
   const positionals: string[] = [];
@@ -99,6 +109,7 @@ function help(): string {
     '    harspec web <url> [options]          public surface, no session, no browser',
     '    harspec capture <url> [options]      drive your local browser, write a HAR',
     '    harspec reproduce <url|har>          generate a standalone app from the capture',
+    '    harspec brief <url|har> [options]    write an evidence pack an agent rebuilds from',
     '',
     '  Options',
     '    -o, --out <dir>        Output directory (default: ./harspec-out)',
@@ -114,6 +125,9 @@ function help(): string {
     '    -h, --help             Print this help',
     '',
     '  Modes',
+    '    brief      Measures the rendered page — layout tree, tokens, screenshot,',
+    '               controls — and writes a BRIEF.md for a coding agent to rebuild the',
+    '               UI with original code. The evidence REA collects, for web apps.',
     '    reproduce  A URL or a HAR goes in; a standalone app comes out. Own server,',
     '               own UI, seeded from the capture. Nothing from the target is copied.',
     '    capture    Drives a local Chromium browser over the DevTools protocol and',
@@ -130,6 +144,7 @@ function help(): string {
     '    Safari:        Network → Export',
     '',
     '  Examples',
+    '    harspec brief https://music.youtube.com -o pack/',
     '    harspec reproduce https://calendly.com/rick -o my-app',
     '    harspec reproduce https://example.com --interactive',
     '    harspec capture https://example.com -o session.har',
@@ -581,6 +596,189 @@ async function runCapture(args: Args): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// Brief: evidence pack for an agent to rebuild from
+// ---------------------------------------------------------------------------
+
+async function runBrief(args: Args): Promise<number> {
+  const quiet = args.quiet || args.json;
+  const target = args.input as string;
+  const outDir = resolve(args.out);
+  const progress = quiet ? undefined : (m: string) => console.log(dim(`  ${m}`));
+  const onProgress = progress ?? (() => {});
+
+  const isUrl = /^https?:\/\//i.test(target);
+  if (!isUrl) {
+    const path = resolve(target);
+    if (!existsSync(path)) {
+      console.error(red(`error: no such file: ${path}`));
+      return 1;
+    }
+  }
+
+  if (!quiet) {
+    console.log('');
+    console.log(`${bold('harspec')} ${dim(`v${VERSION} · brief`)}`);
+  }
+
+  let entries: Entry[] = [];
+  let evidence: Evidence | undefined = undefined;
+  let label = target;
+  let captureError: Error | undefined;
+
+  if (isUrl) {
+    // A wedged renderer is real and not rare on heavy single-page apps. Two
+    // tries with a fresh browser costs a minute and turns a dead run into a
+    // usable pack; a single try turns it into a bug report.
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        entries = await captureSession(target, {
+          interactive: args.interactive,
+          seconds: args.seconds,
+          onProgress: progress,
+          observe: async (cdp) => {
+            evidence = await observePage(cdp, onProgress);
+          },
+        });
+        if (!evidence || evidence.nodes.length < 20) {
+          throw new Error('the page rendered nothing measurable');
+        }
+        captureError = undefined;
+        break;
+      } catch (error: any) {
+        captureError = error;
+        evidence = undefined;
+        if (attempt === 1) {
+          if (!quiet) console.log(yellow(`  ${error.message} — retrying with a fresh browser`));
+          continue;
+        }
+      }
+    }
+
+    if (captureError) {
+      console.error(red(`error: ${captureError.message}`));
+      console.error(dim('  try again, or use --interactive so the page loads in a real window'));
+      return 1;
+    }
+  } else {
+    try {
+      entries = readHar(resolve(target));
+      label = entries[0]?.host ?? target;
+    } catch (error: any) {
+      console.error(red(`error: ${error.message}`));
+      return 1;
+    }
+  }
+
+  const clusters = clusterEntries(entries);
+  const model = deriveAppModel(clusters, {
+    name: args.title ?? deriveAppName(entries, label),
+    documents: entries
+      .filter((entry) => entry.kind === 'document' && entry.resText)
+      .map((entry) => ({
+        path: entry.pathname,
+        html: entry.resText,
+        title: entry.resText.match(/<title[^>]*>([^<]*)</i)?.[1]?.trim(),
+      })),
+  });
+
+  mkdirSync(outDir, { recursive: true });
+
+  // A full-page PDF is the only capture path some browsers allow; turn it into
+  // the PNG an agent (and a person) can actually look at.
+  let screenshots: { full?: string; viewport?: string } | undefined;
+  if (evidence?.screenshot?.pdf) {
+    if (!quiet) console.log(dim(`  converting the page image`));
+    const raster = await rasterise(evidence.screenshot.pdf, join(outDir, 'evidence'), {
+      width: evidence.screenshot.width ?? evidence.meta.viewport.width,
+      height: Math.min(evidence.meta.viewport.height, evidence.screenshot.height ?? 900),
+    });
+    screenshots = { full: raster.full, viewport: raster.viewport };
+  }
+  // A screenshot of the first screen beats a crop of the tall image: the crop
+  // is where fixed headers and sidebars disappear.
+  if (evidence?.screenshot?.viewportBase64) {
+    const viewportPath = join(outDir, 'evidence', 'viewport.png');
+    mkdirSync(join(outDir, 'evidence'), { recursive: true });
+    writeFileSync(viewportPath, Buffer.from(evidence.screenshot.viewportBase64, 'base64'));
+    screenshots = { ...(screenshots ?? {}), viewport: viewportPath };
+  }
+
+  const written = writeBriefPack({
+    label,
+    outDir,
+    evidence,
+    appName: model.name,
+    screenshots,
+    collections: model.collections.map((collection) => ({
+      key: collection.key,
+      label: collection.label,
+      fields: collection.fields.map((field) => field.name),
+      items: collection.items,
+    })),
+    endpoints: clusters.map((cluster) => ({
+      method: cluster.method,
+      path: cluster.template,
+      status: cluster.entries[0]?.status ?? 0,
+      contentType: cluster.entries[0]?.mime ?? 'unknown',
+    })),
+  });
+
+  if (args.json) {
+    console.log(
+      JSON.stringify(
+        {
+          mode: 'brief',
+          out: outDir,
+          source: label,
+          app: model.name,
+          files: written,
+          evidence: evidence
+            ? {
+                nodes: evidence.nodes.length,
+                interactions: evidence.interactions.length,
+                images: evidence.images.length,
+                viewport: evidence.meta.viewport,
+                document: evidence.meta.document,
+              }
+            : null,
+          collections: model.collections.map((c) => ({ key: c.key, records: c.items.length })),
+        },
+        null,
+        2,
+      ),
+    );
+    return 0;
+  }
+
+  if (args.quiet) {
+    console.log(outDir);
+    return 0;
+  }
+
+  console.log('');
+  if (evidence) {
+    for (const line of summariseEvidence(evidence)) console.log(`  ${line}`);
+    console.log('');
+  } else {
+    console.log(yellow('  no page evidence: this pack came from a HAR, so there is no layout,'));
+    console.log(yellow('  no screenshot and no computed styles — only traffic and data.'));
+    console.log('');
+  }
+  console.log(`  ${green('✓')} ${plural(model.collections.length, 'collection', 'collections')}, ${plural(
+    model.collections.reduce((sum, c) => sum + c.items.length, 0),
+    'record',
+    'records',
+  )}, ${plural(clusters.length, 'endpoint', 'endpoints')}`);
+  console.log('');
+  for (const file of written) console.log(`  ${dim('·')} ${file}`);
+  console.log('');
+  console.log(`  open:  ${bold(outDir)}/BRIEF.md`);
+  console.log(dim('  point a coding agent at that folder; it has the evidence, not the answer'));
+  console.log('');
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 
 async function main(): Promise<number> {
   let args: Args;
@@ -611,7 +809,9 @@ async function main(): Promise<number> {
       ? runReproduce(args)
       : args.mode === 'capture'
         ? runCapture(args)
-        : runHar(args);
+        : args.mode === 'brief'
+          ? runBrief(args)
+          : runHar(args);
 }
 
 main()

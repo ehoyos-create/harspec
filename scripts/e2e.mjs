@@ -285,6 +285,25 @@ async function main() {
       'ignores structured SEO metadata',
       !payloads.some((p) => p.items.some((item) => item['@type'])),
     );
+    // ---- brief: the evidence pack an agent rebuilds from ------------------
+    const briefOut = join(ROOT, 'harspec-out', 'e2e-brief');
+    rmSync(briefOut, { recursive: true, force: true });
+    const briefRun = await run('node', ['src/cli.ts', 'brief', HAR, '-o', briefOut, '--json']);
+    let briefJson = {};
+    try {
+      briefJson = JSON.parse(briefRun.stdout);
+    } catch {
+      briefJson = {};
+    }
+    check('brief runs from a HAR', briefRun.code === 0, briefRun.stderr.slice(0, 200));
+    check('brief writes the pack', existsSync(join(briefOut, 'BRIEF.md')), briefRun.stdout.slice(0, 200));
+    check('brief writes the data', existsSync(join(briefOut, 'data/records.json')));
+    check('brief writes the endpoints', existsSync(join(briefOut, 'data/endpoints.json')));
+    check('brief carries the records over', (briefJson.collections ?? []).some((c) => c.records > 0), JSON.stringify(briefJson.collections));
+    check('brief says there is no page evidence for a HAR', (briefJson.evidence ?? null) === null);
+    const briefText = readFileSync(join(briefOut, 'BRIEF.md'), 'utf8');
+    check('brief tells the agent to write new code', briefText.includes('Write new code'));
+    check('brief names the collections', (briefJson.collections ?? []).length > 0);
   } finally {
     server.kill('SIGTERM');
   }

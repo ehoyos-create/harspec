@@ -12,6 +12,17 @@ npx harspec reproduce https://calendly.com/rick -o my-app
 cd my-app && npm start
 ```
 
+When the UI has to *look* like the original rather than just work, the same
+capture produces an evidence pack for a coding agent instead:
+
+```bash
+npx harspec brief https://music.youtube.com -o pack   # → pack/BRIEF.md + screenshot + layout
+```
+
+Two outputs, one measurement: a generated app you can run tonight, or the
+evidence an agent needs to rebuild the interface faithfully. See
+[The evidence pack](#the-evidence-pack).
+
 ```
 harspec v0.1.0 · reproduce
 source    calendly.com
@@ -106,6 +117,70 @@ Music, plenty of Next.js pages — still produce an app: `harspec` reads the dat
 embedded in the HTML (`__NEXT_DATA__`, escaped payloads, JSON islands) and treats
 it as a collection like any other.
 
+A template UI has a ceiling, and it is a low one: it can show your records, but it
+will never look like a bespoke app. That is what `brief` is for.
+
+## The evidence pack
+
+When the point is *fidelity* rather than CRUD, don't ask a template to do a
+designer's job. Ask `harspec` for the evidence, and let a coding agent rebuild the
+UI with its own code:
+
+```bash
+npx harspec brief https://music.youtube.com -o pack
+```
+
+```
+harspec v0.1.0 · brief
+  page        1440x900 viewport, 1440x4337 document
+  elements    2315 measured
+  controls    301 interactive
+  images      103
+  repeats     20x, 10x, 10x, 10x, 9x
+
+  ✓ 1 collection, 20 records, 76 endpoints
+
+  open:  pack/BRIEF.md
+```
+
+The pack is a measurement of what the page actually rendered:
+
+```
+pack/
+├── BRIEF.md                    what to build, and the fidelity test
+├── evidence/
+│   ├── screenshot.png          the whole page, at the capture width
+│   ├── viewport.png            the first screen
+│   ├── layout.json             box tree + sections + repeated components
+│   ├── tokens.json             palette, type scale, radii, spacing, ranked
+│   ├── interactions.json       every control, its position, where links go
+│   └── images.json             pictures, alt text, rendered size
+└── data/
+    ├── records.json            the content the app displayed
+    └── endpoints.json          the calls it made
+```
+
+`layout.json` is the part that does the work. Every node carries its document
+coordinates and only the style properties that differ from its parent, so the
+tree reads as instructions: *this is a flex row, gap 24, containing ten cards of
+145x240 starting at x=346*. `sections` turns that into what a person sees —
+eleven shelves with their titles, item counts and item texts.
+
+Then hand the folder to Claude Code, Codex, Cursor or whatever writes your code:
+
+> rebuild this UI in `pack/`, match `evidence/screenshot.png`, use the data in
+> `data/records.json`
+
+That is the same division of labour the big reverse-engineering MCP servers use —
+the tool collects evidence, the model writes the implementation — applied to web
+apps instead of binaries. The tool stays deterministic; the fidelity comes from
+the model, and the evidence is what stops it from guessing.
+
+Deep DOM included: shadow roots are walked (that is where modern apps keep their
+entire UI), zero-height containers are descended through instead of pruned, and
+the browser is told the truth about its engine so sites that sniff user-agent
+data render the real app instead of a "your browser is not supported" page.
+
 ## The rest of the pipeline
 
 Same capture, three more artifacts:
@@ -174,6 +249,7 @@ merged schemas and multi-page lists mean the tool can tell required from optiona
 
 ```
 harspec reproduce <url|har> [options]   capture (if a URL) → generate a standalone app
+harspec brief     <url|har> [options]   capture → evidence pack for an agent to rebuild from
 harspec capture   <url>     [options]   drive a local browser, write a HAR
 harspec <capture.har>       [options]   spec + typed client + risk report
 harspec web <url>           [options]   public surface only, no session, no browser
@@ -209,6 +285,10 @@ you should know before you show it to anyone:
 - **It is a starting point, not a drop-in replacement.** You get a working
   skeleton with your data shapes and your real records — thrown away in minutes,
   which is the point.
+- **`brief` measures one viewport, once.** Responsive behaviour, hover states and
+  anything behind a click are not in the pack unless you captured them. Use
+  `--interactive` and click through the app yourself before running `brief` on
+  the HAR; that is the difference between one shelf and the whole page.
 
 Not designed for WebSocket-only APIs, GraphQL beyond introspection detection, or
 binary payloads (protobuf, msgpack).
@@ -238,27 +318,34 @@ Real sites, no account, 2026-10-29:
 | `calendly.com/rick` | `reproduce` | 2 resources, 1 real event type, app runs |
 | `www.hostinger.com` | `reproduce` | 10 products with prices and specs, app runs |
 | `music.youtube.com` | `reproduce` | 20 songs with artwork, read from data embedded in the page |
+| `music.youtube.com` | `brief` | 2,315 elements, 11 shelves with titles and items, 103 images, full-page screenshot |
 | `vercel.com` | `web` | Next.js · 10 API paths · 76 routes |
 | `linear.app` | `web` | Next.js · 9 API paths · 40 routes |
 
 `npm run e2e` runs the whole thing against the included demo target: capture,
 spec, client (imported and called against the live API), report, and the generated
-app (booted and exercised over HTTP). 57 assertions.
+app (booted and exercised over HTTP), plus the brief pack. 65 assertions.
 
 ## Architecture
 
 ```
-capture.ts  ──▶ HAR ──▶ har.ts      normalize, template paths, group into operations
+                 ┌──▶ brief.ts     layout tree, tokens, screenshot, pack
+                 │
+capture.ts ──▶ HAR ──▶ har.ts      normalize, template paths, group into operations
                           ├─▶ infer.ts    JSON Schema from every sample of every field
                           ├─▶ openapi.ts  OpenAPI 3.1
                           ├─▶ client.ts   typed TypeScript client
                           ├─▶ report.ts   findings with evidence
                           └─▶ reproduce.ts app model → server + UI
+
+browser.ts is the whole browser layer: a DevTools client on the WebSocket Node
+already ships, so there is no Playwright to install and no bundled Chromium.
 ```
 
 The core is deterministic: no model calls, same input in, same files out. That is
 what makes the output reviewable — you can diff two runs, read the generator, and
-trust what it emits.
+trust what it emits. `brief` keeps that promise: the same page measured twice
+produces the same tree, and the only non-deterministic step is the screenshot.
 
 ## License
 

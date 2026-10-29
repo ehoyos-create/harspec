@@ -7,189 +7,9 @@
  * any bot protection: it is a real browser doing normal browsing.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
 import type { Entry } from './har.ts';
+import { applyChromeIdentity, type Cdp, openBrowser, pinViewport, sleep, withDeadline } from './browser.ts';
 import { tryJson } from './util.ts';
-
-/**
- * Any Chromium-family browser works, because they all speak the same protocol.
- * Keeping the list wide matters: most people do not have plain Chrome installed.
- */
-const MAC_APPS = [
-  'Google Chrome',
-  'Google Chrome Beta',
-  'Google Chrome Canary',
-  'Chromium',
-  'Microsoft Edge',
-  'Brave Browser',
-  'Vivaldi',
-  'Opera',
-  'Arc',
-  'Dia',
-  'Sidekick',
-  'SigmaOS',
-];
-
-function macCandidates(): string[] {
-  const roots = ['/Applications', join(homedir(), 'Applications')];
-  const out: string[] = [];
-  for (const root of roots) {
-    for (const app of MAC_APPS) {
-      const binary = app.replace(/\s+/g, '');
-      out.push(join(root, `${app}.app`, 'Contents', 'MacOS', app));
-      out.push(join(root, `${app}.app`, 'Contents', 'MacOS', binary));
-    }
-  }
-  return out;
-}
-
-function linuxCandidates(): string[] {
-  return [
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/snap/bin/chromium',
-    '/usr/bin/microsoft-edge',
-    '/usr/bin/brave-browser',
-  ];
-}
-
-function windowsCandidates(): string[] {
-  const roots = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
-  ];
-  return roots;
-}
-
-function scanCandidates(): string[] {
-  const explicit = [process.env.HARSPEC_CHROME].filter(Boolean) as string[];
-  const list = [...explicit, ...macCandidates(), ...linuxCandidates(), ...windowsCandidates()];
-
-  // Last resort on macOS: look inside every installed app bundle for a
-  // Chromium-style binary, which catches browsers we have never heard of.
-  if (process.platform === 'darwin') {
-    for (const root of ['/Applications', join(homedir(), 'Applications')]) {
-      let entries: string[] = [];
-      try {
-        entries = readdirSync(root);
-      } catch {
-        continue;
-      }
-      for (const name of entries) {
-        if (!name.endsWith('.app')) continue;
-        const base = name.slice(0, -4);
-        list.push(join(root, name, 'Contents', 'MacOS', base));
-      }
-    }
-  }
-
-  return [...new Set(list)];
-}
-
-export function findChrome(): string | undefined {
-  return scanCandidates().find((path) => existsSync(path));
-}
-
-export function browserSearchHint(): string {
-  const tried = scanCandidates().slice(0, 6).map((p) => `  ${p}`);
-  return [
-    'no Chromium-family browser found. harspec can drive Chrome, Chromium, Edge,',
-    'Brave, Arc, Dia, Vivaldi or Opera over the DevTools protocol.',
-    '',
-    'looked in:',
-    ...tried,
-    '  … and every app bundle in /Applications',
-    '',
-    'fix one of these:',
-    '  export HARSPEC_CHROME="/Applications/Your Browser.app/Contents/MacOS/Your Browser"',
-    '  harspec reproduce capture.har        # export a HAR from DevTools → Network → Save all as HAR',
-  ].join('\n');
-}
-
-interface Pending {
-  resolve: (value: any) => void;
-  reject: (error: Error) => void;
-}
-
-class Cdp {
-  private socket: WebSocket;
-  private nextId = 1;
-  private pending = new Map<number, Pending>();
-  private listeners = new Map<string, Array<(params: any) => void>>();
-
-  private constructor(socket: WebSocket) {
-    this.socket = socket;
-    this.socket.addEventListener('message', (event: MessageEvent) => {
-      let message: any;
-      try {
-        message = JSON.parse(String(event.data));
-      } catch {
-        return;
-      }
-      if (message.id && this.pending.has(message.id)) {
-        const entry = this.pending.get(message.id)!;
-        this.pending.delete(message.id);
-        if (message.error) entry.reject(new Error(message.error.message ?? 'CDP error'));
-        else entry.resolve(message.result);
-        return;
-      }
-      if (message.method) {
-        for (const listener of this.listeners.get(message.method) ?? []) listener(message.params);
-      }
-    });
-  }
-
-  static async connect(url: string, timeoutMs = 10_000): Promise<Cdp> {
-    const socket = new WebSocket(url);
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('CDP connect timed out')), timeoutMs);
-      socket.addEventListener('open', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      socket.addEventListener('error', () => {
-        clearTimeout(timer);
-        reject(new Error('CDP connect failed'));
-      });
-    });
-    return new Cdp(socket);
-  }
-
-  send(method: string, params: Record<string, any> = {}): Promise<any> {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.send(JSON.stringify({ id, method, params }));
-      setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(`${method} timed out`));
-        }
-      }, 30_000);
-    });
-  }
-
-  on(event: string, listener: (params: any) => void) {
-    const list = this.listeners.get(event) ?? [];
-    list.push(listener);
-    this.listeners.set(event, list);
-  }
-
-  close() {
-    try {
-      this.socket.close();
-    } catch {
-      // ignore
-    }
-  }
-}
 
 interface Tracked {
   requestId: string;
@@ -225,73 +45,36 @@ export interface CaptureOptions {
   interactive?: boolean;
   /** Hard stop for interactive capture, in seconds. */
   seconds?: number;
+  /** Run while the page is loaded, before the browser closes. */
+  observe?: (cdp: Cdp) => Promise<void>;
+  /** Hard cap for the whole capture, in ms. A wedged renderer never recovers. */
+  hardTimeoutMs?: number;
   onProgress?: (message: string) => void;
 }
 
 export async function captureSession(url: string, options: CaptureOptions = {}): Promise<Entry[]> {
-  const chrome = findChrome();
-  if (!chrome) throw new Error(browserSearchHint());
-
-  const timeoutMs = options.timeoutMs ?? 30_000;
-  const idleMs = options.idleMs ?? 2_500;
   const headless = options.headless ?? !options.interactive;
   const onProgress = options.onProgress ?? (() => {});
-  const profile = mkdtempSync(join(tmpdir(), 'harspec-chrome-'));
-  const port = 9000 + Math.floor(Math.random() * 1000);
-
-  const launch = (isHeadless: boolean): ChildProcess =>
-    spawn(
-      chrome,
-      [
-        ...(isHeadless ? ['--headless=new'] : []),
-        `--remote-debugging-port=${port}`,
-        `--user-data-dir=${profile}`,
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--hide-scrollbars',
-        '--window-size=1440,900',
-        'about:blank',
-      ],
-      { stdio: 'ignore', detached: false },
-    );
-
-  let child = launch(headless);
-
-  const cleanup = () => {
-    try {
-      child.kill('SIGKILL');
-    } catch {
-      // ignore
-    }
-    try {
-      rmSync(profile, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-  };
+  const session = await openBrowser({ headless, onProgress });
+  const limit = options.hardTimeoutMs ?? 150_000;
 
   try {
-    onProgress(`starting ${headless ? 'headless ' : ''}browser`);
-    // Some builds (Arc, Dia, some Electron shells) refuse to start headless.
-    // A windowed run still works and is quieter about it than failing.
-    let browserVersion = '';
-    try {
-      browserVersion = await waitForDevTools(port, 15_000);
-    } catch (error) {
-      if (!headless) throw error;
-      onProgress('headless mode was refused, starting with a window');
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // ignore
-      }
-      child = launch(false);
-      browserVersion = await waitForDevTools(port, 20_000);
-    }
-    const target = await createTarget(port);
-    const cdp = await Cdp.connect(target.webSocketDebuggerUrl);
+    return await withDeadline(runCapture(session.cdp, session.version, url, options), limit, () => {
+      // A wedged renderer will never answer again. Killing the browser is the
+      // only way out, and the caller can retry with a fresh one.
+      session.close();
+    });
+  } finally {
+    session.close();
+  }
+}
+
+async function runCapture(cdp: Cdp, browserVersion: string, url: string, options: CaptureOptions): Promise<Entry[]> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const idleMs = options.idleMs ?? 2_500;
+  const onProgress = options.onProgress ?? (() => {});
+
+  {
 
     const tracked = new Map<string, Tracked>();
     const bodyJobs: Array<Promise<void>> = [];
@@ -371,6 +154,8 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
     });
 
     await cdp.send('Page.enable');
+    await pinViewport(cdp);
+
     await cdp.send('Network.enable', {
       maxTotalBufferSize: 50_000_000,
       maxResourceBufferSize: 10_000_000,
@@ -379,14 +164,7 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
     // Headless browsers announce themselves ("HeadlessChrome/156"), and several
     // large sites answer with "your browser is deprecated" instead of the app.
     // We are a real Chromium; say so, and keep the version we actually run.
-    const major = browserVersion.match(/(\d+)\./)?.[1] ?? '126';
-    await cdp
-      .send('Network.setUserAgentOverride', {
-        userAgent: `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`,
-        acceptLanguage: 'en-US,en;q=0.9',
-        platform: 'MacIntel',
-      })
-      .catch(() => {});
+    await applyChromeIdentity(cdp, browserVersion);
 
     onProgress(`navigating to ${url}`);
     await cdp.send('Page.navigate', { url });
@@ -434,7 +212,7 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
       // the traffic that follows, exactly like DevTools would.
       await waitForUser(options.seconds);
       await settle(3_000);
-    } else if (options.scroll !== false) {
+    } else if (options.scroll !== false && !options.observe) {
       // Many apps only fetch their data once the viewport reaches a section.
       onProgress('scrolling to trigger lazy requests');
       for (const fraction of [0.5, 1, 0.5, 0]) {
@@ -451,18 +229,18 @@ export async function captureSession(url: string, options: CaptureOptions = {}):
 
     // Response bodies arrive asynchronously; wait for every read to land
     // before serialising, otherwise fast exits produce empty payloads.
+    if (options.observe) {
+      try {
+        await options.observe(cdp);
+      } catch (error: any) {
+        onProgress(`observation failed: ${error.message}`);
+      }
+    }
+
     await Promise.allSettled(bodyJobs);
 
-    const entries = toEntries(tracked, url);
-    cdp.close();
-    return entries;
-  } finally {
-    cleanup();
+    return toEntries(tracked, url);
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
