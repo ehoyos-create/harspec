@@ -518,7 +518,8 @@ async function runReproduce(args: Args): Promise<number> {
     return 0;
   }
 
-  console.log(`${dim('source   ')} ${label}`);
+  const source = (model.sourceHost || label).replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  console.log(`${dim('source   ')} ${source}`);
   console.log(`${dim('app      ')} ${model.name}`);
   console.log('');
   console.log(appSummary(model));
